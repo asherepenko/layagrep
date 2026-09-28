@@ -74,7 +74,8 @@ fn retrieves_relevant_file_and_excerpts() {
     write_repo(&root);
 
     let store = cache::Cache::new(root.join(".cache"), false);
-    let mut engine = engine::Engine::new(Box::new(AuthMock), store);
+    let mut factory: engine::JudgeFactory = Box::new(|| Ok(Box::new(AuthMock)));
+    let mut engine = engine::Engine::new("mock-checkpoint", factory, store);
     let options = retrieve::SearchOptions {
         policy: walk::Policy::default(),
         query: "Where is the password verified during login?".to_string(),

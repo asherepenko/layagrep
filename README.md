@@ -47,7 +47,9 @@ Measured behavior of the judge drove the design (details in
 3. **Gate** — the Laya judge grades each ranked file's description. Absolute
    file-level judgment is noisy for a 421M encoder, so it gates (rejecting
    lexically-matching but off-topic files) and modulates the ranking rather
-   than ranking alone.
+   than ranking alone. The judge is **lazy**: it only spawns (process + model
+   load) on the first cache miss, so fully-cached reruns finish in ~0.1–0.3 s
+   with no engine at all.
 4. **Select** — declaration units (functions, classes with member units, or
    text chunks for other files) are judged by description (name, signature,
    local calls). Selected units merge into excerpt windows expanded with
@@ -94,10 +96,12 @@ All report output goes to stdout; progress and engine logs go to stderr.
   than a cloud-LLM judge would place them, and topically-named noise (a texture
   cache for "caching" queries) can appear below the true hits.
 - First search on a large repository takes tens of seconds (one judge call per
-   lexically-matching file, plus per-declaration selection); repeats hit the
-  cache in ~2–3 s.
-- Declaration parsing covers Python and TypeScript/JavaScript; other text
-  files fall back to bounded chunks.
+  lexically-matching file, plus per-declaration selection); repeats of a
+  cached query finish in ~0.1–0.3 s.
+- Declaration parsing covers Python, TypeScript/JavaScript, Rust, and Go;
+  other text files fall back to bounded chunks. Import-graph propagation
+  resolves relative TS/JS imports, Python modules, and `crate::` paths; Go
+  package imports inform descriptions but do not resolve to files.
 
 ## License
 

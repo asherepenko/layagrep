@@ -15,8 +15,14 @@ use std::collections::HashMap;
 pub const STATE_CHAR_BUDGET: usize = 1000;
 pub const PROMPT_VERSION: &str = "layagrep-4";
 
+/// Judges are expensive to create (process spawn + model load). The factory
+/// defers that cost until the first cache miss, so fully-cached reruns never
+/// pay it.
+pub type JudgeFactory = Box<dyn FnMut() -> Result<Box<dyn Judge>, crate::judge::JudgeError>>;
+
 pub struct Engine {
-    judge: Box<dyn Judge>,
+    factory: JudgeFactory,
+    judge: Option<Box<dyn Judge>>,
     cache: Cache,
     namespace: Namespace,
     pub requests: u64,
@@ -41,23 +47,41 @@ pub struct Evaluation<'a> {
 }
 
 impl Engine {
-    pub fn new(judge: Box<dyn Judge>, cache: Cache) -> Self {
+    pub fn new(model_id: &str, factory: JudgeFactory, cache: Cache) -> Self {
         Engine {
+            // Cache answers are checkpoint outputs; backends agree to the 4th
+            // decimal, so the namespace is backend-independent and cached
+            // answers transfer across engines.
             namespace: Namespace {
-                model: judge.namespace(),
+                model: model_id.to_string(),
                 dtype: String::new(),
                 protocol: "laya-jsonl-1".to_string(),
                 prompt_version: PROMPT_VERSION.to_string(),
             },
-            judge,
+            factory,
+            judge: None,
             cache,
             requests: 0,
             state_truncations: 0,
         }
     }
 
-    pub fn describe_backend(&self) -> String {
-        self.judge.describe()
+    /// Force judge creation (doctor path).
+    pub fn spawn_now(&mut self) -> Result<(), EngineError> {
+        self.ensure_judge().map(|_| ())
+    }
+
+    fn ensure_judge(&mut self) -> Result<&mut Box<dyn Judge>, EngineError> {
+        if self.judge.is_none() {
+            let judge = (self.factory)().map_err(|e| EngineError(e.0))?;
+            self.judge = Some(judge);
+        }
+        Ok(self.judge.as_mut().expect("judge was just set"))
+    }
+
+    /// The live backend, if one was spawned.
+    pub fn backend(&self) -> Option<&dyn Judge> {
+        self.judge.as_deref()
     }
 
     pub fn cache_issues(&self) -> Vec<(String, u32)> {
@@ -108,7 +132,7 @@ impl Engine {
             .map(|(id, q)| (id.clone(), q.clone()))
             .collect();
         let answers = self
-            .judge
+            .ensure_judge()?
             .predict(state, &questions)
             .map_err(|e| EngineError(e.0))?;
         self.requests += 1;

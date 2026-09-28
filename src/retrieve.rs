@@ -143,6 +143,8 @@ fn header_comment(source: &str) -> Option<String> {
 fn import_specifiers(snapshot: &Snapshot, inspection: Option<&Inspection>) -> Vec<String> {
     let mut specs = Vec::new();
     let is_python = snapshot.path.ends_with(".py") || snapshot.path.ends_with(".pyi");
+    let is_rust = snapshot.path.ends_with(".rs");
+    let is_go = snapshot.path.ends_with(".go");
     for line in snapshot.source.lines().take(400) {
         let trimmed = line.trim();
         if is_python {
@@ -153,6 +155,23 @@ fn import_specifiers(snapshot: &Snapshot, inspection: Option<&Inspection>) -> Ve
             } else if let Some(rest) = trimmed.strip_prefix("import ") {
                 let module = rest.split(',').next().unwrap_or("").trim();
                 let module = module.split(" as ").next().unwrap_or(module).trim();
+                if !module.is_empty() {
+                    specs.push(module.to_string());
+                }
+            }
+        } else if is_rust {
+            if let Some(rest) = trimmed.strip_prefix("use ") {
+                let module = rest.split(';').next().unwrap_or("").trim();
+                let module = module.split(" as ").next().unwrap_or(module).trim();
+                let module = module.trim_start_matches("r#");
+                let module = module.split('{').next().unwrap_or(module).trim();
+                if !module.is_empty() {
+                    specs.push(module.to_string());
+                }
+            }
+        } else if is_go {
+            if let Some(rest) = trimmed.strip_prefix("import ") {
+                let module = rest.trim().trim_matches('"');
                 if !module.is_empty() {
                     specs.push(module.to_string());
                 }
@@ -231,6 +250,17 @@ fn resolve_import(spec: &str, from_path: &str, files: &HashSet<String>) -> Optio
         }
         for index in ["index.ts", "index.tsx", "index.js", "__init__.py"] {
             candidates.push(format!("{}/{}", joined, index));
+        }
+    } else if spec.starts_with("crate::") {
+        let slashed = spec
+            .trim_start_matches("crate::")
+            .split("::")
+            .filter(|part| *part != "self")
+            .collect::<Vec<_>>()
+            .join("/");
+        for base in ["src", "."] {
+            candidates.push(format!("{}/{}/mod.rs", base, slashed));
+            candidates.push(format!("{}/{}.rs", base, slashed));
         }
     } else {
         // Python-style dotted module.
@@ -679,7 +709,7 @@ fn python_call_leads(
 }
 
 fn build_repository_context(
-    tree: &crate::walk::Tree,
+    _tree: &crate::walk::Tree,
     files: &[FileEvidence],
     declarations: &HashMap<String, Vec<(String, Range)>>,
     root: &Path,

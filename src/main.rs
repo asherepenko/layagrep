@@ -205,27 +205,24 @@ fn search(cli: &Cli, query: String) -> i32 {
         include_dependencies: cli.include_dependencies,
         include_sensitive: cli.include_sensitive,
     };
-    let engine_start = std::time::Instant::now();
-    let judge_backend = match judge::create_judge(
-        to_engine(cli.engine),
-        &cli.model,
-        cli.dtype.as_str(),
-        cli.python.as_deref(),
-    ) {
-        Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("Judge backend failed: {}", error);
-            return 1;
-        }
-    };
-    if !cli.quiet {
-        eprintln!("[layagrep] engine: {} (started in {:.1}s)", judge_backend.describe(), engine_start.elapsed().as_secs_f64());
-    }
+    let engine_kind = to_engine(cli.engine);
+    let model_id = cli.model.clone();
+    let dtype = cli.dtype.as_str().to_string();
+    let python = cli.python.clone();
+    let mut factory: engine::JudgeFactory = Box::new(move || {
+        judge::create_judge(engine_kind, &model_id, &dtype, python.as_deref())
+    });
     let cache = cache::Cache::new(worker::cache_dir(), !cli.no_cache);
-    let mut engine = engine::Engine::new(judge_backend, cache);
+    let mut engine = engine::Engine::new(&cli.model, factory, cache);
     let mut progress = retrieve::Progress::new(!cli.quiet && stderr_isatty());
     let options = retrieve::SearchOptions { policy, query: query.clone(), root, debug_scores: cli.debug_scores };
     let result = retrieve::retrieve(&options, &mut engine, &mut progress, &interrupted);
+    if !cli.quiet {
+        match engine.backend() {
+            Some(backend) => eprintln!("[layagrep] engine: {}", backend.describe()),
+            None => eprintln!("[layagrep] engine: fully cached, no judge spawned"),
+        }
+    }
     let mut stdout = std::io::stdout();
     let rendered = render::render_result(&result, cli.max_source_bytes);
     if stdout.write_all(rendered.as_bytes()).and_then(|_| stdout.flush()).is_err() {
@@ -240,25 +237,26 @@ fn search(cli: &Cli, query: String) -> i32 {
 
 fn doctor(engine_kind: judge::EngineKind, model: &str, dtype: &str, python: Option<&str>) -> i32 {
     eprintln!("Starting judge backend (first run may download the checkpoint)…");
-    let backend = match judge::create_judge(engine_kind, model, dtype, python) {
-        Ok(backend) => backend,
-        Err(error) => {
-            eprintln!("Laya engine check failed: {}", error);
-            return 1;
-        }
-    };
-    let mut engine = engine::Engine::new(backend, cache::Cache::new(worker::cache_dir(), false));
-    eprintln!("Engine: {}", engine.describe_backend());
+    let model_owned = model.to_string();
+    let dtype_owned = dtype.to_string();
+    let python_owned = python.map(str::to_string);
+    let mut factory: engine::JudgeFactory =
+        Box::new(move || judge::create_judge(engine_kind, &model_owned, &dtype_owned, python_owned.as_deref()));
+    let mut engine = engine::Engine::new(model, factory, cache::Cache::new(worker::cache_dir(), false));
+    if let Err(error) = engine.spawn_now() {
+        eprintln!("Laya engine check failed: {}", error);
+        return 1;
+    }
+    let backend = engine
+        .backend()
+        .map(|b| b.describe())
+        .unwrap_or_else(|| "unknown".to_string());
     match engine.judge_bool(
         "Source: export function recordEvent(event) { events.push(event); }",
         "Does this source implement recording an event?",
     ) {
         Ok(probability) if probability > 0.5 => {
-            println!(
-                "Laya connection verified through {} (P = {:.3}).",
-                engine.describe_backend(),
-                probability
-            );
+            println!("Laya connection verified through {} (P = {:.3}).", backend, probability);
             0
         }
         Ok(probability) => {

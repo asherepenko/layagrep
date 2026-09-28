@@ -91,3 +91,41 @@ fn python_units() {
     assert!(units.iter().any(|n| n.starts_with("Session.context")), "units: {:?}", units);
     assert!(units.iter().any(|n| n.starts_with("Session.login")), "units: {:?}", units);
 }
+
+#[test]
+fn java_units() {
+    let text = "package a.b;\nimport java.util.List;\n\npublic class Greeter {\n    private String name;\n\n    public Greeter(String name) {\n        this.name = name;\n    }\n\n    public String greet() {\n        return \"hi\";\n    }\n}\n\ninterface Hello {\n    void say();\n}\n";
+    let units = names(&snapshot_of("Greeter.java", text));
+    assert!(units.iter().any(|n| n.starts_with("Greeter.context")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Greeter.greet")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Greeter.name")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Hello")), "units: {:?}", units);
+}
+
+#[test]
+fn swift_units() {
+    let text = "import Foundation\n\npublic struct Point {\n    var x: Int = 0\n    func magnitude() -> Int {\n        return x * x\n    }\n}\n\nclass Api {\n    func fetch() -> Data? {\n        return nil\n    }\n}\n\nfunc topLevel(x: Int) -> Int {\n    return x\n}\n";
+    let units = names(&snapshot_of("Point.swift", text));
+    assert!(units.iter().any(|n| n.starts_with("Point.context")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Point.magnitude")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Api.fetch")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("topLevel")), "units: {:?}", units);
+}
+
+#[test]
+fn kotlin_units() {
+    let text = "package a.b\n\nclass Greeter(val name: String) {\n    fun greet(): String = \"hi\"\n}\n\nobject Singleton {\n    fun instance(): Singleton = this\n}\n\nfun topLevel(x: Int): Int = x\n";
+    let units = names(&snapshot_of("Greeter.kt", text));
+    assert!(units.iter().any(|n| n.starts_with("Greeter.greet")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("Singleton.instance")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("topLevel")), "units: {:?}", units);
+}
+
+#[test]
+fn cpp_units() {
+    let text = "#include \"local.h\"\n\nnamespace engine {\n\nclass Cache {\npublic:\n    int get(const char* key);\nprivate:\n    int size_ = 0;\n};\n\nint Cache::get(const char* key) {\n    return 0;\n}\n\ntemplate <typename T>\nT identity(T x) { return x; }\n\n}\n";
+    let units = names(&snapshot_of("cache.cpp", text));
+    assert!(units.iter().any(|n| n.contains("Cache.context")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.starts_with("engine.Cache.get") || n.starts_with("Cache.get")), "units: {:?}", units);
+    assert!(units.iter().any(|n| n.contains("identity")), "units: {:?}", units);
+}

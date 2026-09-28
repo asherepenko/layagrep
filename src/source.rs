@@ -100,6 +100,17 @@ fn script_kind(path: &str) -> Option<&'static str> {
         Some("rust")
     } else if path.ends_with(".go") {
         Some("go")
+    } else if path.ends_with(".java") {
+        Some("java")
+    } else if path.ends_with(".swift") {
+        Some("swift")
+    } else if path.ends_with(".kt") || path.ends_with(".kts") {
+        Some("kotlin")
+    } else if matches!(
+        path.rsplit('.').next().unwrap_or(""),
+        "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hh" | "hxx" | "ipp"
+    ) {
+        Some("cpp")
     } else {
         None
     }
@@ -151,12 +162,52 @@ pub fn inspect(snapshot: &Snapshot) -> Inspection {
             "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             "rust" => tree_sitter_rust::LANGUAGE.into(),
             "go" => tree_sitter_go::LANGUAGE.into(),
+            "java" => tree_sitter_java::LANGUAGE.into(),
+            "swift" => tree_sitter_swift::LANGUAGE.into(),
+            "kotlin" => tree_sitter_kotlin::LANGUAGE.into(),
+            "cpp" => tree_sitter_cpp::LANGUAGE.into(),
             _ => tree_sitter_javascript::LANGUAGE.into(),
         };
         if let Some(tree) = parse(language, &snapshot.source) {
             let mut units = Vec::new();
             let mut comments = Vec::new();
             match kind {
+                "java" => java_visit(
+                    tree.root_node(),
+                    &snapshot.source,
+                    &index,
+                    "",
+                    &mut Vec::new(),
+                    &mut units,
+                    &mut comments,
+                ),
+                "swift" => swift_visit(
+                    tree.root_node(),
+                    &snapshot.source,
+                    &index,
+                    "",
+                    &mut Vec::new(),
+                    &mut units,
+                    &mut comments,
+                ),
+                "kotlin" => kotlin_visit(
+                    tree.root_node(),
+                    &snapshot.source,
+                    &index,
+                    "",
+                    &mut Vec::new(),
+                    &mut units,
+                    &mut comments,
+                ),
+                "cpp" => cpp_visit(
+                    tree.root_node(),
+                    &snapshot.source,
+                    &index,
+                    "",
+                    &mut Vec::new(),
+                    &mut units,
+                    &mut comments,
+                ),
                 "rust" => rust_visit(
                     tree.root_node(),
                     &snapshot.source,
@@ -791,4 +842,406 @@ fn go_visit(
             _ => {}
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Java
+// ---------------------------------------------------------------------------
+
+fn java_visit(
+    node: tree_sitter::Node,
+    source: &str,
+    index: &LineIndex,
+    prefix: &str,
+    owner_headers: &mut Vec<Range>,
+    units: &mut Vec<SourceUnit>,
+    comments: &mut Vec<Range>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "line_comment" | "block_comment" => comments.push(node_range(child, source, index)),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+            | "record_declaration" => {
+                let name = named_child_text(child, source, "name").unwrap_or("Anonymous");
+                let qualified = format!("{}{}", prefix, name);
+                let body = child
+                    .child_by_field_name("body")
+                    .or_else(|| child.named_child(0).filter(|n| n.kind().ends_with("_body")));
+                if let Some(body) = body {
+                    if let Some(header) =
+                        push_class_header(child, body, &qualified, source, index, owner_headers, units)
+                    {
+                        owner_headers.push(header);
+                        java_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                        owner_headers.pop();
+                    } else {
+                        java_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                    }
+                }
+            }
+            "method_declaration" | "constructor_declaration" => {
+                push_named_unit(child, source, index, prefix, "", owner_headers, units);
+            }
+            "field_declaration" => {
+                let mut inner = child.walk();
+                let mut names: Vec<&str> = Vec::new();
+                for declarator in child.children(&mut inner) {
+                    if declarator.kind() == "variable_declarator" {
+                        if let Some(name) = named_child_text(declarator, source, "name") {
+                            names.push(name);
+                        }
+                    }
+                }
+                if !names.is_empty() {
+                    units.push(SourceUnit {
+                        name: format!("{}{}", prefix, names.join(", ")),
+                        range: node_range(child, source, index),
+                        byte_start: child.start_byte(),
+                        byte_end: child.end_byte(),
+                        owner_headers: owner_headers.clone(),
+                        partial: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Emit the `Name.context` header unit for a class-like node; returns the
+/// header range for owner tracking.
+fn push_class_header(
+    node: tree_sitter::Node,
+    body: tree_sitter::Node,
+    qualified: &str,
+    source: &str,
+    index: &LineIndex,
+    owner_headers: &[Range],
+    units: &mut Vec<SourceUnit>,
+) -> Option<Range> {
+    let class_range = node_range(node, source, index);
+    let first = body.named_child(0)?;
+    let first_line = node_range(first, source, index).start_line;
+    if first_line <= class_range.start_line {
+        return None;
+    }
+    let header = Range {
+        start_line: class_range.start_line,
+        end_line: first_line - 1,
+    };
+    units.push(SourceUnit {
+        name: format!("{}.context", qualified),
+        range: header,
+        byte_start: node.start_byte(),
+        byte_end: index.line_end(header.end_line) + 1,
+        owner_headers: owner_headers.to_vec(),
+        partial: false,
+    });
+    Some(header)
+}
+
+// ---------------------------------------------------------------------------
+// Swift
+// ---------------------------------------------------------------------------
+
+fn swift_visit(
+    node: tree_sitter::Node,
+    source: &str,
+    index: &LineIndex,
+    prefix: &str,
+    owner_headers: &mut Vec<Range>,
+    units: &mut Vec<SourceUnit>,
+    comments: &mut Vec<Range>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "comment" | "multiline_comment" => comments.push(node_range(child, source, index)),
+            "class_declaration" | "protocol_declaration" | "enum_declaration" | "struct_declaration"
+            | "actor_declaration" => {
+                if let Some(name) = named_child_text(child, source, "name") {
+                    let qualified = format!("{}{}", prefix, name);
+                    if let Some(body) = child.named_children(&mut child.walk())
+                        .find(|n| n.kind().ends_with("_body"))
+                    {
+                        if let Some(header) =
+                            push_class_header(child, body, &qualified, source, index, owner_headers, units)
+                        {
+                            owner_headers.push(header);
+                            swift_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                            owner_headers.pop();
+                        } else {
+                            swift_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                        }
+                    }
+                }
+            }
+            "function_declaration" | "init_declaration" => {
+                push_named_unit(child, source, index, prefix, "", owner_headers, units);
+            }
+            "property_declaration" => {
+                if let Some(pattern) = child.child_by_field_name("name") {
+                    if let Some(name) = find_swift_identifier(pattern, source) {
+                        units.push(SourceUnit {
+                            name: format!("{}{}", prefix, name),
+                            range: node_range(child, source, index),
+                            byte_start: child.start_byte(),
+                            byte_end: child.end_byte(),
+                            owner_headers: owner_headers.clone(),
+                            partial: false,
+                        });
+                    }
+                }
+            }
+            "type_alias" => {
+                if let Some(name) = named_child_text(child, source, "name") {
+                    units.push(SourceUnit {
+                        name: format!("{}{}", prefix, name),
+                        range: node_range(child, source, index),
+                        byte_start: child.start_byte(),
+                        byte_end: child.end_byte(),
+                        owner_headers: owner_headers.clone(),
+                        partial: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn first_kind_text<'a>(node: tree_sitter::Node<'a>, source: &'a str, kinds: &[&str]) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if kinds.contains(&child.kind()) {
+            return Some(&source[child.byte_range()]);
+        }
+    }
+    None
+}
+
+fn find_swift_identifier<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "identifier" || child.kind() == "simple_identifier" {
+            return Some(&source[child.byte_range()]);
+        }
+        if let Some(found) = find_swift_identifier(child, source) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Kotlin
+// ---------------------------------------------------------------------------
+
+fn kotlin_visit(
+    node: tree_sitter::Node,
+    source: &str,
+    index: &LineIndex,
+    prefix: &str,
+    owner_headers: &mut Vec<Range>,
+    units: &mut Vec<SourceUnit>,
+    comments: &mut Vec<Range>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "comment" => comments.push(node_range(child, source, index)),
+            "class_declaration" | "object_declaration" => {
+                let name = named_child_text(child, source, "name")
+                    .map(str::to_string)
+                    .or_else(|| first_kind_text(child, source, &["type_identifier"]).map(str::to_string))
+                    .unwrap_or_else(|| "Anonymous".to_string());
+                let qualified = format!("{}{}", prefix, name);
+                if let Some(body) = child
+                    .named_children(&mut child.walk())
+                    .find(|n| n.kind() == "class_body")
+                {
+                    if let Some(header) =
+                        push_class_header(child, body, &qualified, source, index, owner_headers, units)
+                    {
+                        owner_headers.push(header);
+                        kotlin_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                        owner_headers.pop();
+                    } else {
+                        kotlin_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                    }
+                }
+            }
+            "function_declaration" => {
+                if named_child_text(child, source, "name").is_some() {
+                    push_named_unit(child, source, index, prefix, "", owner_headers, units);
+                } else {
+                    if let Some(name) = first_kind_text(child, source, &["simple_identifier"]) {
+                        units.push(SourceUnit {
+                            name: format!("{}{}", prefix, name),
+                            range: node_range(child, source, index),
+                            byte_start: child.start_byte(),
+                            byte_end: child.end_byte(),
+                            owner_headers: owner_headers.clone(),
+                            partial: false,
+                        });
+                    }
+                }
+            }
+            "property_declaration" => {
+                let mut inner = child.walk();
+                let mut name: Option<&str> = None;
+                for declaration in child.children(&mut inner) {
+                    if declaration.kind() == "variable_declaration" {
+                        if let Some(found) = find_swift_identifier(declaration, source) {
+                            name = Some(found);
+                        }
+                    }
+                }
+                if let Some(name) = name {
+                    units.push(SourceUnit {
+                        name: format!("{}{}", prefix, name),
+                        range: node_range(child, source, index),
+                        byte_start: child.start_byte(),
+                        byte_end: child.end_byte(),
+                        owner_headers: owner_headers.clone(),
+                        partial: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C++
+// ---------------------------------------------------------------------------
+
+fn cpp_function_name<'a>(node: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let declarator = node.child_by_field_name("declarator")?;
+    let mut current = declarator;
+    loop {
+        if matches!(
+            current.kind(),
+            "identifier" | "field_identifier" | "qualified_identifier" | "destructor_name"
+        ) {
+            return Some(source[current.byte_range()].replace("::", "."));
+        }
+        current = current.child_by_field_name("declarator")?;
+    }
+}
+
+fn cpp_visit(
+    node: tree_sitter::Node,
+    source: &str,
+    index: &LineIndex,
+    prefix: &str,
+    owner_headers: &mut Vec<Range>,
+    units: &mut Vec<SourceUnit>,
+    comments: &mut Vec<Range>,
+) {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        cpp_visit_one(child, source, index, prefix, owner_headers, units, comments);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpp_visit_one(
+    child: tree_sitter::Node,
+    source: &str,
+    index: &LineIndex,
+    prefix: &str,
+    owner_headers: &mut Vec<Range>,
+    units: &mut Vec<SourceUnit>,
+    comments: &mut Vec<Range>,
+) {
+    match child.kind() {
+        "comment" => comments.push(node_range(child, source, index)),
+        "namespace_definition" => {
+            let name = named_child_text(child, source, "name").unwrap_or("");
+            let nested = if name.is_empty() {
+                prefix.to_string()
+            } else {
+                format!("{}{}::", prefix, name)
+            };
+            if let Some(list) = child.child_by_field_name("body") {
+                cpp_visit(list, source, index, &nested, owner_headers, units, comments);
+            }
+        }
+        "template_declaration" => {
+            let mut cursor = child.walk();
+            for inner in child.children(&mut cursor) {
+                if inner.is_named() && inner.kind() != "template_parameter_list" {
+                    cpp_visit_one(inner, source, index, prefix, owner_headers, units, comments);
+                }
+            }
+        }
+        "class_specifier" | "struct_specifier" => {
+            let Some(name) = named_child_text(child, source, "name") else { return };
+            let qualified = format!("{}{}", prefix, name);
+            if let Some(body) = child
+                .named_children(&mut child.walk())
+                .find(|n| n.kind() == "field_declaration_list")
+            {
+                if let Some(header) =
+                    push_class_header(child, body, &qualified, source, index, owner_headers, units)
+                {
+                    owner_headers.push(header);
+                    cpp_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                    owner_headers.pop();
+                } else {
+                    cpp_visit(body, source, index, &format!("{}.", qualified), owner_headers, units, comments);
+                }
+            }
+        }
+        "function_definition" => {
+            if let Some(name) = cpp_function_name(child, source) {
+                units.push(SourceUnit {
+                    name,
+                    range: node_range(child, source, index),
+                    byte_start: child.start_byte(),
+                    byte_end: child.end_byte(),
+                    owner_headers: owner_headers.clone(),
+                    partial: false,
+                });
+            }
+        }
+        "field_declaration" if !prefix.is_empty() => {
+            if let Some(name) = cpp_field_name(child, source) {
+                units.push(SourceUnit {
+                    name,
+                    range: node_range(child, source, index),
+                    byte_start: child.start_byte(),
+                    byte_end: child.end_byte(),
+                    owner_headers: owner_headers.clone(),
+                    partial: false,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn cpp_field_name<'a>(declaration: tree_sitter::Node<'a>, source: &'a str) -> Option<String> {
+    let mut cursor = declaration.walk();
+    for child in declaration.children(&mut cursor) {
+        match child.kind() {
+            "function_declarator" => {
+                if let Some(name) = cpp_function_name(child, source) {
+                    return Some(name);
+                }
+            }
+            "init_declarator" | "declarator" | "identifier" | "field_identifier"
+            | "qualified_identifier" => {
+                let text = &source[child.byte_range()];
+                if text.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '~') {
+                    return Some(text.replace("::", "."));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }

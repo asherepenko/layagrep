@@ -145,6 +145,13 @@ fn import_specifiers(snapshot: &Snapshot, inspection: Option<&Inspection>) -> Ve
     let is_python = snapshot.path.ends_with(".py") || snapshot.path.ends_with(".pyi");
     let is_rust = snapshot.path.ends_with(".rs");
     let is_go = snapshot.path.ends_with(".go");
+    let is_java = snapshot.path.ends_with(".java");
+    let is_kotlin = snapshot.path.ends_with(".kt") || snapshot.path.ends_with(".kts");
+    let is_swift = snapshot.path.ends_with(".swift");
+    let is_cpp = matches!(
+        snapshot.path.rsplit('.').next().unwrap_or(""),
+        "cpp" | "cc" | "cxx" | "c" | "h" | "hpp" | "hh" | "hxx" | "ipp"
+    );
     for line in snapshot.source.lines().take(400) {
         let trimmed = line.trim();
         if is_python {
@@ -174,6 +181,36 @@ fn import_specifiers(snapshot: &Snapshot, inspection: Option<&Inspection>) -> Ve
                 let module = rest.trim().trim_matches('"');
                 if !module.is_empty() {
                     specs.push(module.to_string());
+                }
+            }
+        } else if is_java || is_kotlin {
+            if let Some(rest) = trimmed.strip_prefix("import ") {
+                let module = rest
+                    .trim_start_matches("static ")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !module.is_empty() {
+                    specs.push(module.to_string());
+                }
+            }
+        } else if is_swift {
+            if let Some(rest) = trimmed.strip_prefix("import ") {
+                let module = rest.split(';').next().unwrap_or("").trim();
+                if !module.is_empty() {
+                    specs.push(module.to_string());
+                }
+            }
+        } else if is_cpp {
+            if trimmed.starts_with("#include") {
+                if let Some(position) = trimmed.find('"') {
+                    if let Some(end) = trimmed[position + 1..].find('"') {
+                        let module = &trimmed[position + 1..position + 1 + end];
+                        if !module.is_empty() {
+                            specs.push(module.to_string());
+                        }
+                    }
                 }
             }
         } else {
@@ -251,6 +288,26 @@ fn resolve_import(spec: &str, from_path: &str, files: &HashSet<String>) -> Optio
         for index in ["index.ts", "index.tsx", "index.js", "__init__.py"] {
             candidates.push(format!("{}/{}", joined, index));
         }
+    } else if spec.matches('.').count() >= 1
+        && !spec.contains('/')
+        && !spec.contains("::")
+        && !spec.contains('"')
+    {
+        // Java/Kotlin dotted imports: a.b.C -> a/b/C.{java,kt} in common layouts.
+        let slashed = spec.replace('.', "/");
+        for ext in [".java", ".kt"] {
+            let mut paths = vec![format!("{}{}", slashed, ext)];
+            for base in ["src", "src/main/java", "src/main/kotlin"] {
+                let candidate = format!("{}/{}{}", base, slashed, ext);
+                if !paths.contains(&candidate) {
+                    paths.push(candidate);
+                }
+            }
+            if let Some(hit) = paths.into_iter().find(|p| p != from_path && files.contains(p)) {
+                return Some(hit);
+            }
+        }
+        return None;
     } else if spec.starts_with("crate::") {
         let slashed = spec
             .trim_start_matches("crate::")
@@ -267,6 +324,18 @@ fn resolve_import(spec: &str, from_path: &str, files: &HashSet<String>) -> Optio
         let slashed = spec.trim_start_matches('.').replace('.', "/");
         for tail in [&slashed, &format!("{}.py", slashed), &format!("{}/__init__.py", slashed)] {
             candidates.push(tail.clone());
+        }
+    }
+    if candidates.is_empty() {
+        // Quoted C/C++ includes resolve against the including file's directory.
+        let from_dir = from_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        let joined = if from_dir.is_empty() {
+            spec.to_string()
+        } else {
+            format!("{}/{}", from_dir, spec)
+        };
+        if joined != from_path && files.contains(&joined) {
+            return Some(joined);
         }
     }
     candidates.into_iter().find(|candidate| candidate != from_path && files.contains(candidate))

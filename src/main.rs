@@ -107,6 +107,10 @@ struct Cli {
     #[arg(long)]
     debug_scores: bool,
 
+    /// Emit structured JSON instead of the text report
+    #[arg(long)]
+    json: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -224,7 +228,11 @@ fn search(cli: &Cli, query: String) -> i32 {
         }
     }
     let mut stdout = std::io::stdout();
-    let rendered = render::render_result(&result, cli.max_source_bytes);
+    let rendered = if cli.json {
+        render::render_json(&result)
+    } else {
+        render::render_result(&result, cli.max_source_bytes)
+    };
     if stdout.write_all(rendered.as_bytes()).and_then(|_| stdout.flush()).is_err() {
         return 0; // EPIPE: consumer closed early
     }

@@ -39,8 +39,8 @@ Measured behavior of the judge drove the design (details in
 1. **Describe** — every eligible file (respecting `.gitignore`/`.ignore`,
    skipping hidden paths, dependency/build directories, sensitive names,
    binaries, non-UTF-8) is parsed with tree-sitter (Python,
-   TypeScript/JavaScript) into a short description: path, header, declaration
-   names, imports.
+   TypeScript/JavaScript, Rust, Go, Java, Kotlin, Swift, C/C++) into a short
+   description: path, header, declaration names, imports.
 2. **Rank** — BM25 over those descriptions ranks files lexically
    (identifier-aware tokenization, inflection variants); scores propagate along
    the import graph so structurally-relevant files score in.
@@ -82,9 +82,15 @@ layagrep [OPTIONS] <QUERY> [ROOT]
   --include-sensitive           include known sensitive filenames
   --no-cache                    disable answer cache
   --max-source-bytes N          source allocation; 0 = unlimited
+  --json                        structured output (schema v1) instead of text
   --debug-scores                per-file scores + phase timings on stderr
   -q, --quiet                   suppress stderr progress
 ```
+
+`--json` emits `{version, root, query, status, files[{path, score, roles,
+leads, callLeads, excerpts, sourceOmitted}], repositoryContext, issues,
+warnings, counts, providerFailure}` — stable camelCase schema, rounded
+scores, line-numbered excerpts.
 
 Exit codes: `0` complete, `1` failed, `2` incomplete, `130` interrupted.
 All report output goes to stdout; progress and engine logs go to stderr.
@@ -98,10 +104,12 @@ All report output goes to stdout; progress and engine logs go to stderr.
 - First search on a large repository takes tens of seconds (one judge call per
   lexically-matching file, plus per-declaration selection); repeats of a
   cached query finish in ~0.1–0.3 s.
-- Declaration parsing covers Python, TypeScript/JavaScript, Rust, and Go;
-  other text files fall back to bounded chunks. Import-graph propagation
-  resolves relative TS/JS imports, Python modules, and `crate::` paths; Go
-  package imports inform descriptions but do not resolve to files.
+- Declaration parsing covers Python, TypeScript/JavaScript, Rust, Go, Java,
+  Kotlin, Swift, and C/C++; other text files fall back to bounded chunks.
+  Import-graph propagation resolves relative TS/JS imports, Python modules,
+  Rust `crate::` paths, Java/Kotlin dotted imports (common layouts), and
+  quoted C/C++ includes; Go and Swift module imports inform descriptions but
+  do not resolve to files.
 
 ## License
 

@@ -28,7 +28,9 @@ defaults to the current directory; a narrower folder limits the search to that
 subtree. Use `layagrep --help` for available options.
 
 Results print to stdout; no report file is created. The complete context ends
-with `End context.`; shell output limits may truncate it.
+with `End context.`; shell output limits may truncate it. Pass `--json` for a
+structured schema-v1 payload (files with scored excerpts and line ranges)
+when the caller prefers structured data over the text report.
 
 ## Output
 
@@ -51,3 +53,6 @@ repeated searches are fast. `layagrep cache clear` resets the cache.
   installed `laya-mlx` Python package, else the native Rust engine).
 - `--hidden`, `--no-ignore`, `--include-dependencies`,
   `--include-sensitive` broaden only their named exclusion category.
+- Declaration parsing: Python, TypeScript/JavaScript, Rust, Go, Java, Kotlin,
+  Swift, C/C++; other text uses chunk fallback.
+- Repeat queries hit a local answer cache (~0.1–0.3 s, no model spawn).

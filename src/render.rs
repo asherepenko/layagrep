@@ -170,3 +170,67 @@ pub fn render_result(result: &RetrievalResult, max_source_bytes: usize) -> Strin
     lines.push("End context.".to_string());
     lines.join("\n") + "\n"
 }
+
+
+/// Structured output for programmatic consumers. Schema version 1, camelCase.
+pub fn render_json(result: &RetrievalResult) -> String {
+    let files: Vec<serde_json::Value> = result
+        .files
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "path": file.path,
+                "score": (file.score * 10000.0).round() / 10000.0,
+                "roles": file.roles,
+                "leads": file.leads.iter().map(|lead| serde_json::json!({
+                    "name": lead.name,
+                    "startLine": lead.range.start_line,
+                    "endLine": lead.range.end_line,
+                    "score": (lead.score * 10000.0).round() / 10000.0,
+                })).collect::<Vec<_>>(),
+                "callLeads": file.call_leads.iter().map(|call| serde_json::json!({
+                    "caller": call.caller,
+                    "name": call.name,
+                    "startLine": call.range.start_line,
+                    "endLine": call.range.end_line,
+                })).collect::<Vec<_>>(),
+                "excerpts": file.excerpts.iter().map(|excerpt| serde_json::json!({
+                    "startLine": excerpt.range.start_line,
+                    "endLine": excerpt.range.end_line,
+                    "source": excerpt.source,
+                })).collect::<Vec<_>>(),
+                "sourceOmitted": file.source_omitted,
+            })
+        })
+        .collect();
+    let status = match result.status {
+        Status::Complete => "complete",
+        Status::Incomplete => "incomplete",
+        Status::Interrupted => "interrupted",
+    };
+    let payload = serde_json::json!({
+        "version": 1,
+        "root": result.root,
+        "query": result.query,
+        "status": status,
+        "files": files,
+        "repositoryContext": {
+            "instructionFiles": result.repository_context.instruction_files,
+            "instructionLookupIncomplete": result.repository_context.instruction_lookup_incomplete,
+            "pytestFiles": result.repository_context.pytest_files,
+        },
+        "issues": result.issues.iter().map(|(kind, count)| serde_json::json!({
+            "kind": kind, "count": count,
+        })).collect::<Vec<_>>(),
+        "warnings": result.warnings.iter().map(|(kind, count)| serde_json::json!({
+            "kind": kind, "count": count,
+        })).collect::<Vec<_>>(),
+        "counts": {
+            "requests": result.counts.requests,
+            "cacheHits": result.counts.cache_hits,
+            "inspectedFiles": result.counts.inspected_files,
+        },
+        "providerFailure": result.provider_failure,
+    });
+    serde_json::to_string_pretty(&payload).unwrap_or_default() + "\n"
+}

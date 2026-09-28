@@ -1,6 +1,6 @@
 [package]
 name = "layagrep"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -13,10 +13,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
 tree-sitter = "0.27.0"
+tree-sitter-cpp = "0.23.4"
 tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
 tree-sitter-javascript = "0.25.0"
+tree-sitter-kotlin = { version = "0.4.0", path = "vendor/tree-sitter-kotlin" }
 tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
+tree-sitter-swift = { version = "0.7.3", path = "vendor/tree-sitter-swift" }
 tree-sitter-typescript = "0.23.2"
 walkdir = "2.5.0"
 

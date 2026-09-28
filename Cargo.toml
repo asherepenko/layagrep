@@ -1,0 +1,25 @@
+[package]
+name = "layagrep"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+ctrlc = "3.5.2"
+hex = "0.4.3"
+ignore = "0.4.33"
+laya-rs = { version = "0.1.0", default-features = false, features = ["hub"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tree-sitter = "0.27.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-python = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+walkdir = "2.5.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.11", features = ["accelerate"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = "0.11"

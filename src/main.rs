@@ -47,59 +47,61 @@ impl Dtype {
 #[derive(Parser)]
 #[command(
     name = "layagrep",
-    about = "Find code by asking what it does — judged by a local Laya model",
+    about = "Find code by asking what it does — judged by a local Laya typed-decision model",
+    long_about = "layagrep — source retrieval for coding agents, judged by a local Laya model.\n\nAsk a natural-language question about a repository. layagrep parses files with\ntree-sitter (Python, TS/JS, Rust, Go, Java, Kotlin, Swift, C/C++), ranks them\nlexically, gates and grades them with a local ~400M-parameter Laya encoder, and\nprints ranked files, verbatim source excerpts with line references, and\ndeclaration leads. No cloud API, no keys; everything runs locally.\n\nSibling of jevgrep (dzhng/jevgrep) with a local judge instead of the Jev cloud LLM.",
     version,
     disable_help_subcommand = true,
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    after_help = "Examples:\n  layagrep \"How are telemetry events recorded and sent?\" .\n  layagrep --json \"Where is auth checked before a handler?\" ./src\n  layagrep --engine native --workers 4 \"retry behavior on timeout?\"\n\nCommands:\n  layagrep doctor              verify the judge backend end to end\n  layagrep cache clear         clear cached judge answers\n  layagrep skill --dir .       write the agent SKILL.md\n\nEnvironment:\n  LAYAGREP_PYTHON             interpreter for the python backend (same as --python)\n\nExit codes:\n  0 complete  1 failed  2 incomplete (issues reported)  130 interrupted\n\nThe report goes to stdout; progress and engine logs go to stderr.\nEvaluation answers are cached in $XDG_CACHE_HOME/layagrep (7-day TTL, 256 MB\ncap); repeated searches skip the judge entirely."
 )]
 struct Cli {
-    /// Natural-language repository question
+    /// Natural-language repository question, e.g. "How are requests cached?"
     query: Option<String>,
 
-    /// Search root (defaults to the current directory)
+    /// Search root directory (default: current directory; use -- before a root starting with '-')
     root: Option<String>,
 
-    /// Include hidden paths
+    /// Include hidden (dot-prefixed) paths
     #[arg(long)]
     hidden: bool,
 
-    /// Disable .gitignore/.ignore patterns
+    /// Disable .gitignore/.ignore pattern matching (global git excludes still apply)
     #[arg(long)]
     no_ignore: bool,
 
-    /// Include dependency and build directories
+    /// Include dependency and build directories (node_modules, target, dist, ...)
     #[arg(long)]
     include_dependencies: bool,
 
-    /// Include known sensitive filenames/content
+    /// Include known sensitive filenames (.env, *.pem, id_rsa, ...) and private-key content
     #[arg(long)]
     include_sensitive: bool,
 
-    /// Disable cache reads and writes
+    /// Disable answer-cache reads and writes for this run
     #[arg(long)]
     no_cache: bool,
 
-    /// Source allocation in bytes; 0 means unlimited
+    /// Total source-byte budget for the text report; 0 means unlimited
     #[arg(long, default_value_t = render::DEFAULT_MAX_SOURCE_BYTES)]
     max_source_bytes: usize,
 
-    /// Judge backend
+    /// Judge backend: auto prefers an installed laya-mlx python package, else native
     #[arg(long, value_enum, default_value_t = EngineChoice::Auto)]
     engine: EngineChoice,
 
-    /// Laya checkpoint (HF id or local path)
+    /// Laya checkpoint: Hugging Face id or local path
     #[arg(long, default_value = judge::DEFAULT_MODEL_ID)]
     model: String,
 
-    /// Model dtype for the judge
+    /// Model dtype; the native backend promotes float16/bfloat16 to float32 on CPU
     #[arg(long, value_enum, default_value_t = Dtype::Float16)]
     dtype: Dtype,
 
-    /// Python interpreter hosting the laya-mlx worker (python backend)
+    /// Python interpreter hosting laya_mlx; default: the laya-mlx launcher's interpreter, then LAYAGREP_PYTHON, then python3
     #[arg(long)]
     python: Option<String>,
 
-    /// Suppress stderr progress output
+    /// Suppress stderr progress output (engine info still prints once)
     #[arg(long, short = 'q')]
     quiet: bool,
 
@@ -107,11 +109,14 @@ struct Cli {
     #[arg(long)]
     debug_scores: bool,
 
-    /// Emit structured JSON instead of the text report
+    /// Emit structured JSON (schema v1: files, excerpts, leads, roles, counts) instead of the text report
     #[arg(long)]
     json: bool,
 
-    /// Parallel judge workers (0 = auto: 2 for python, 4 for native)
+    /// Parallel judge workers (0 = auto: 1 for python, 4 for native)
+    ///
+    /// Measured: concurrent MLX processes contend on one GPU (2 python workers
+    /// are 4.3x slower — keep 1); native CPU workers scale near-linearly to 4.
     #[arg(long, default_value_t = 0)]
     workers: usize,
 
@@ -129,36 +134,48 @@ enum EngineChoice {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Verify the judge backend with a synthetic question
+    #[command(
+        long_about = "Verify the judge backend with a synthetic question.\n\nSpawns the selected engine (first run may download the ~850 MB checkpoint from Hugging Face), runs one prediction, and checks the answer. Use it after install or when searches behave unexpectedly."
+    )]
     Doctor {
-        /// Judge backend
-        #[arg(long, value_enum, default_value_t = EngineChoice::Auto)]
+        /// Judge backend: auto, python, or native
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = EngineChoice::Auto,
+            help = "Judge backend: auto prefers python (laya-mlx), else native"
+        )]
         engine: EngineChoice,
-        /// Laya checkpoint
-        #[arg(long, default_value = judge::DEFAULT_MODEL_ID)]
+        /// Laya checkpoint: HF id or local path
+        #[arg(long, help = "Laya checkpoint: Hugging Face id or local path")]
         model: String,
-        /// Model dtype
-        #[arg(long, value_enum, default_value_t = Dtype::Float16)]
+        /// Model dtype; native promotes float16/bfloat16 to float32 on CPU
+        #[arg(long, value_enum, default_value_t = Dtype::Float16, help = "Model dtype")]
         dtype: Dtype,
-        /// Python interpreter for the worker backend
-        #[arg(long)]
+        /// Python interpreter hosting laya_mlx
+        #[arg(long, help = "Python interpreter hosting laya_mlx")]
         python: Option<String>,
     },
     /// Cache management
+    #[command(long_about = "Cache management.\n\nEvaluation answers live in $XDG_CACHE_HOME/layagrep (default ~/.cache/layagrep): JSON entries keyed by exact state + questions, 7-day TTL, 256 MB cap, oldest-first eviction. The resident python worker script is cached there too.")]
     Cache {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Print (or install with --dir) the agent skill for layagrep
+    /// Print the agent skill; --dir writes SKILL.md into a directory
+    #[command(
+        long_about = "Print the agent skill describing layagrep usage for coding agents.\n\nWith --dir, writes SKILL.md (uppercase) into the directory — point it at your agent's skills directory, e.g. `.claude/skills/layagrep`, `.agents/skills/layagrep`, or `~/.pi/agent/skills/layagrep`."
+    )]
     Skill {
-        /// Write SKILL.md into this directory
-        #[arg(long)]
+        /// Directory to write SKILL.md into (stdout if omitted)
+        #[arg(long, help = "Directory to write SKILL.md into (printed to stdout when omitted)")]
         dir: Option<PathBuf>,
     },
 }
 
 #[derive(Debug, Subcommand)]
 enum CacheAction {
-    /// Clear cached evaluation answers
+    /// Clear cached evaluation answers (searches afterwards re-judge from scratch)
     Clear,
 }
 

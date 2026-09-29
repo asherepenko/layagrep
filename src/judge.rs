@@ -23,12 +23,22 @@ impl std::fmt::Display for JudgeError {
 }
 impl std::error::Error for JudgeError {}
 
-pub trait Judge {
+pub type Job = (String, HashMap<String, Question>);
+
+pub trait Judge: Send {
     fn predict(
         &mut self,
         state: &str,
         questions: &HashMap<String, Question>,
     ) -> Result<Answers, JudgeError>;
+
+    /// Many independent jobs. Pools override this to fan out; the default
+    /// runs sequentially.
+    fn predict_many(&mut self, jobs: Vec<Job>) -> Vec<Result<Answers, JudgeError>> {
+        jobs.into_iter()
+            .map(|(state, questions)| self.predict(&state, &questions))
+            .collect()
+    }
     /// Identity feeds the cache namespace: answers differ per backend/dtype.
     fn namespace(&self) -> String;
     fn describe(&self) -> String;
@@ -226,6 +236,150 @@ pub fn create_judge(
                 }
             }
             Ok(Box::new(NativeJudge::load(model_id, dtype)?))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parallel pool
+// ---------------------------------------------------------------------------
+
+use std::sync::mpsc as sync_mpsc;
+use std::sync::{Arc, Mutex};
+
+struct PoolJob {
+    state: String,
+    questions: HashMap<String, Question>,
+    reply: sync_mpsc::Sender<Result<Answers, JudgeError>>,
+}
+
+/// N independent judge workers consuming one queue. Each worker owns its own
+/// process (python) or model instance (native), so requests execute in
+/// parallel across workers.
+pub struct PoolJudge {
+    submit: Option<sync_mpsc::Sender<PoolJob>>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    workers: usize,
+    description: String,
+}
+
+impl PoolJudge {
+    pub fn spawn(
+        count: usize,
+        build: impl Fn(usize) -> Result<Box<dyn Judge>, JudgeError> + Send + Sync + 'static,
+    ) -> Result<Self, JudgeError> {
+        let (submit, queue) = sync_mpsc::channel::<PoolJob>();
+        let queue = Arc::new(Mutex::new(queue));
+        let mut handles = Vec::new();
+        let description = Arc::new(Mutex::new(String::new()));
+        let workers = count.max(1);
+        let build = Arc::new(build);
+        for index in 0..workers {
+            let builder = Arc::clone(&build);
+            let queue = Arc::clone(&queue);
+            let description = Arc::clone(&description);
+            handles.push(std::thread::spawn(move || {
+                let judge = match builder(index) {
+                    Ok(judge) => judge,
+                    Err(error) => {
+                        eprintln!("[layagrep] worker {} failed to start: {}", index, error);
+                        return;
+                    }
+                };
+                if index == 0 {
+                    if let Ok(mut slot) = description.lock() {
+                        *slot = format!("{} x{}", judge.describe(), workers);
+                    }
+                }
+                let mut judge = judge;
+                loop {
+                    let job = {
+                        let guard = queue.lock().unwrap();
+                        guard.recv()
+                    };
+                    match job {
+                        Ok(job) => {
+                            let _ = job.reply.send(judge.predict(&job.state, &job.questions));
+                        }
+                        Err(_) => break, // queue closed
+                    }
+                }
+            }));
+        }
+        Ok(PoolJudge {
+            submit: Some(submit),
+            handles,
+            workers,
+            description: Arc::try_unwrap(description)
+                .map(|guard| guard.into_inner().unwrap_or_default())
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn workers(&self) -> usize {
+        self.workers
+    }
+}
+
+impl Judge for PoolJudge {
+    fn predict(
+        &mut self,
+        state: &str,
+        questions: &HashMap<String, Question>,
+    ) -> Result<Answers, JudgeError> {
+        let jobs = vec![(state.to_string(), questions.clone())];
+        self.predict_many(jobs).pop().unwrap_or(Err(JudgeError("empty".into())))
+    }
+
+    fn namespace(&self) -> String {
+        "pool".to_string()
+    }
+
+    fn describe(&self) -> String {
+        self.description.clone()
+    }
+
+    fn predict_many(
+        &mut self,
+        jobs: Vec<Job>,
+    ) -> Vec<Result<Answers, JudgeError>> {
+        let mut replies: Vec<Result<sync_mpsc::Receiver<_>, JudgeError>> =
+            Vec::with_capacity(jobs.len());
+        let submit = match &self.submit {
+            Some(submit) => submit.clone(),
+            None => {
+                return jobs
+                    .into_iter()
+                    .map(|_| Err(JudgeError("pool already shut down".into())))
+                    .collect()
+            }
+        };
+        for (state, questions) in jobs {
+            let (tx, rx) = sync_mpsc::channel();
+            if submit.send(PoolJob { state, questions, reply: tx }).is_err() {
+                replies.push(Err(JudgeError("pool worker queue closed".into())));
+                continue;
+            }
+            replies.push(Ok(rx));
+        }
+        replies
+            .into_iter()
+            .map(|receiver| match receiver {
+                Ok(receiver) => match receiver.recv() {
+                    Ok(result) => result,
+                    Err(_) => Err(JudgeError("pool worker died".into())),
+                },
+                Err(error) => Err(error),
+            })
+            .collect()
+    }
+}
+
+impl Drop for PoolJudge {
+    fn drop(&mut self) {
+        self.submit = None; // close the queue: workers exit, child processes drop
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
         }
     }
 }

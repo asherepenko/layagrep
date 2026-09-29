@@ -111,6 +111,10 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
+    /// Parallel judge workers (0 = auto: 2 for python, 4 for native)
+    #[arg(long, default_value_t = 0)]
+    workers: usize,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -213,8 +217,26 @@ fn search(cli: &Cli, query: String) -> i32 {
     let model_id = cli.model.clone();
     let dtype = cli.dtype.as_str().to_string();
     let python = cli.python.clone();
+    let requested = cli.workers;
     let mut factory: engine::JudgeFactory = Box::new(move || {
-        judge::create_judge(engine_kind, &model_id, &dtype, python.as_deref())
+        // Measured on M2 Max: python (MLX GPU) workers contend destructively
+        // (2 workers = 4.3x slower); native CPU workers scale near-linearly.
+        let workers = if requested > 0 {
+            requested
+        } else {
+            match engine_kind {
+                judge::EngineKind::Native => 4,
+                _ => 1,
+            }
+        };
+        let kind = engine_kind;
+        let model = model_id.clone();
+        let dtype = dtype.clone();
+        let python = python.clone();
+        let pool = judge::PoolJudge::spawn(workers, move |_| {
+            judge::create_judge(kind, &model, &dtype, python.as_deref())
+        })?;
+        Ok(Box::new(pool) as Box<dyn judge::Judge>)
     });
     let cache = cache::Cache::new(worker::cache_dir(), !cli.no_cache);
     let mut engine = engine::Engine::new(&cli.model, factory, cache);

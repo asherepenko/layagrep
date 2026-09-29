@@ -8,7 +8,7 @@
 //! right-side truncation.
 
 use crate::cache::{Cache, Namespace};
-use crate::judge::{Answers, Judge};
+use crate::judge::{self, Answers, Judge};
 use crate::worker::Question;
 use std::collections::HashMap;
 
@@ -30,6 +30,7 @@ pub struct Engine {
 }
 
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct EngineError(pub String);
 
 impl std::fmt::Display for EngineError {
@@ -149,6 +150,124 @@ impl Engine {
         }
         self.cache.put(&key, &answers);
         Ok(answers)
+    }
+
+    /// Batch evaluation: cache lookups first, misses fan out to the pool in
+    /// parallel. Returns per-input results in order.
+    pub fn evaluate_many(
+        &mut self,
+        evaluations: &[Evaluation],
+    ) -> Vec<Result<Answers, EngineError>> {
+        let clamped: Vec<(&str, bool)> =
+            evaluations.iter().map(|e| Self::clamp_state(e.state)).collect();
+        let requests: Vec<serde_json::Value> = evaluations
+            .iter()
+            .zip(clamped.iter())
+            .map(|(evaluation, (state, truncated))| {
+                let _ = truncated;
+                Self::request_json(&Evaluation {
+                    state,
+                    questions: evaluation.questions,
+                })
+            })
+            .collect();
+        for ((_, truncated), _) in clamped.iter().zip(requests.iter()) {
+            if *truncated {
+                self.state_truncations += 1;
+            }
+        }
+        let keys: Vec<String> = requests
+            .iter()
+            .map(|request| Cache::key(&self.namespace, request))
+            .collect();
+        let mut cached: Vec<Option<Answers>> = Vec::with_capacity(evaluations.len());
+        for key in &keys {
+            cached.push(self.cache.get(key));
+        }
+        let mut misses: Vec<judge::Job> = evaluations
+            .iter()
+            .zip(clamped.iter())
+            .zip(cached.iter())
+            .filter_map(|((evaluation, (state, _)), hit)| {
+                if hit.is_some() {
+                    None
+                } else {
+                    let questions: HashMap<String, Question> = evaluation
+                        .questions
+                        .iter()
+                        .map(|(id, q)| (id.clone(), q.clone()))
+                        .collect();
+                    Some((state.to_string(), questions))
+                }
+            })
+            .collect();
+        if !misses.is_empty() {
+            let results = self
+                .judge
+                .as_mut()
+                .map(|judge| judge.predict_many(std::mem::take(&mut misses)));
+            let mut results = match results {
+                Some(result) => result,
+                None => {
+                    // Lazy spawn on first miss.
+                    match (self.factory)().map_err(|e| EngineError(e.0)) {
+                        Ok(mut judge) => {
+                            let out = judge.predict_many(std::mem::take(&mut misses));
+                            self.judge = Some(judge);
+                            out
+                        }
+                        Err(error) => {
+                            return evaluations
+                                .iter()
+                                .map(|_| Err(error.clone()))
+                                .collect();
+                        }
+                    }
+                }
+            };
+            self.requests += results.len() as u64;
+            let mut result_iter = results.drain(..);
+            for (index, hit) in cached.iter_mut().enumerate() {
+                if hit.is_none() {
+                    if let Some(result) = result_iter.next() {
+                        match result {
+                            Ok(answers) => {
+                                let valid = evaluations[index]
+                                    .questions
+                                    .iter()
+                                    .all(|(id, _)| {
+                                        matches!(answers.get(id),
+                                            Some(v) if v.is_finite() && (0.0..=1.0).contains(v))
+                                    });
+                                if valid {
+                                    self.cache.put(&keys[index], &answers);
+                                    *hit = Some(answers);
+                                }
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+        evaluations
+            .iter()
+            .zip(cached.into_iter())
+            .map(|(evaluation, hit)| match hit {
+                Some(mut answers) => {
+                    let missing = evaluation
+                        .questions
+                        .iter()
+                        .any(|(id, _)| !answers.contains_key(id));
+                    if missing {
+                        Err(EngineError("incomplete answers".into()))
+                    } else {
+                        Ok(answers)
+                    }
+                }
+                None => Err(EngineError("judge failed for state".into())),
+            })
+            .collect()
     }
 
     /// Convenience: single boolean question over a state.

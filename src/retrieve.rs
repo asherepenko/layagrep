@@ -26,6 +26,11 @@ use std::time::Instant;
 
 const MIN_LEXICAL: f64 = 0.06;
 const SEMANTIC_FLOOR: f64 = 0.3;
+/// Candidates below this blend get declaration leads only (no unit judging).
+const SELECTION_FLOOR: f64 = 0.25;
+/// Role assessment only covers files that produced excerpts, up to this many.
+const MAX_ASSESS: usize = 25;
+const SCORE_CHUNK: usize = 128;
 const PROPAGATION_FACTOR: f64 = 0.75;
 const PROPAGATION_ROUNDS: usize = 2;
 const REQUEST_LIMIT: u64 = 6_000;
@@ -495,33 +500,64 @@ pub fn retrieve(
     let lexical = corpus.rank(&options.query);
     let lexical_by_path: HashMap<&String, f64> =
         paths.iter().zip(lexical.iter()).map(|(path, score)| (*path, *score)).collect();
-    // Only files with some query-term overlap reach the judge.
-    for path in paths.iter().filter(|path| lexical_by_path[*path] > 0.02) {
+    // Only files with some query-term overlap reach the judge; they fan out
+    // to the pool in chunks.
+    let judged_paths: Vec<&String> = paths
+        .iter()
+        .filter(|path| lexical_by_path[*path] > 0.02)
+        .copied()
+        .collect();
+    let states: Vec<String> = judged_paths
+        .iter()
+        .map(|path| {
+            let facts = &facts_by_path[*path];
+            format!("{}\n{}", state_header(&options.query), facts.description)
+        })
+        .collect();
+    let file_questions: Vec<Vec<(String, crate::worker::Question)>> = judged_paths
+        .iter()
+        .map(|_| {
+            vec![(
+                "q".to_string(),
+                crate::worker::Question::Noul { instructions: question.clone() },
+            )]
+        })
+        .collect();
+    for chunk_start in (0..judged_paths.len()).step_by(SCORE_CHUNK) {
         if interrupted() || engine.requests > REQUEST_LIMIT {
             issues.issue("interrupted", 1);
             break;
         }
-        let facts = &facts_by_path[*path];
-        let state = format!("{}\n{}", state_header(&options.query), facts.description);
-        let questions = vec![(
-            "q".to_string(),
-            crate::worker::Question::Noul { instructions: question.clone() },
-        )];
-        match engine.evaluate(&crate::engine::Evaluation { state: &state, questions: &questions }) {
-            Ok(answers) => {
-                let score = answers.get("q").copied().unwrap_or(0.0);
-                if options.debug_scores {
-                    let lex = lexical_by_path[*path];
-                    eprintln!("[score] laya={:.3} lex={:.3} {}", score, lex, path);
+        let chunk_end = (chunk_start + SCORE_CHUNK).min(judged_paths.len());
+        let evaluations: Vec<crate::engine::Evaluation> = (chunk_start..chunk_end)
+            .map(|index| crate::engine::Evaluation {
+                state: &states[index],
+                questions: &file_questions[index],
+            })
+            .collect();
+        let results = engine.evaluate_many(&evaluations);
+        let mut provider_failure: Option<String> = None;
+        for (index, result) in (chunk_start..chunk_end).zip(results.into_iter()) {
+            let path = judged_paths[index];
+            match result {
+                Ok(answers) => {
+                    let score = answers.get("q").copied().unwrap_or(0.0);
+                    if options.debug_scores {
+                        let lex = lexical_by_path[path];
+                        eprintln!("[score] laya={:.3} lex={:.3} {}", score, lex, path);
+                    }
+                    scores.insert(path.clone(), score);
                 }
-                scores.insert((*path).clone(), score);
-            }
-            Err(EngineError(message)) => {
-                issues.fail("provider", message);
-                scores.insert((*path).clone(), 0.0);
+                Err(EngineError(message)) => {
+                    provider_failure = Some(message);
+                    scores.insert(path.clone(), 0.0);
+                }
             }
         }
-        progress.bump(1);
+        if let Some(message) = provider_failure {
+            issues.fail("provider", message);
+        }
+        progress.bump(chunk_end - chunk_start);
     }
 
     let t_score = phase_t0.elapsed();
@@ -582,70 +618,146 @@ pub fn retrieve(
 
     let mut files: Vec<FileEvidence> = Vec::new();
     let mut declarations: HashMap<String, Vec<(String, Range)>> = HashMap::new();
-    for (path, score) in &ranked {
-        if interrupted() {
-            break;
+    let strong: Vec<usize> = ranked
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, score))| *score >= SELECTION_FLOOR)
+        .map(|(index, _)| index)
+        .collect();
+    if !strong.is_empty() && !interrupted() {
+        let inputs: Vec<selection::SelectionInput> = strong
+            .iter()
+            .filter_map(|index| {
+                let (path, _) = &ranked[*index];
+                let facts = facts_by_path.get(path)?;
+                Some(selection::SelectionInput {
+                    snapshot: &facts.snapshot,
+                    inspection: facts.inspection.as_ref(),
+                })
+            })
+            .collect();
+        let mut selected_progress = |_judged: usize| {};
+        let outcomes =
+            selection::select_files(&inputs, &options.query, engine, &mut selected_progress);
+        for (index, (outcome, selection_issues)) in
+            strong.into_iter().zip(outcomes.into_iter())
+        {
+            let (path, score) = &ranked[index];
+            for (kind, count) in selection_issues {
+                issues.issue(kind, count);
+            }
+            let facts = &facts_by_path[path];
+            if let Some(inspection) = &facts.inspection {
+                declarations.insert(
+                    path.clone(),
+                    inspection.units.iter().map(|u| (u.name.clone(), u.range)).collect(),
+                );
+            }
+            let call_leads = if is_python_path(path) {
+                python_call_leads(&facts.snapshot, &outcome.selected, facts.inspection.as_ref())
+            } else {
+                Vec::new()
+            };
+            files.push(FileEvidence {
+                path: path.clone(),
+                score: *score,
+                roles: Vec::new(),
+                priority: None,
+                leads: outcome.leads,
+                call_leads,
+                excerpts: outcome.excerpts,
+                source_omitted: false,
+            });
         }
-        let Some(facts) = facts_by_path.get(path) else { continue };
-        let (outcome, selection_issues) = selection::select_file(
-            &facts.snapshot,
-            facts.inspection.as_ref(),
-            &options.query,
-            engine,
-        );
-        for (kind, count) in selection_issues {
-            issues.issue(kind, count);
-        }
-        if let Some(inspection) = &facts.inspection {
-            declarations.insert(
-                path.clone(),
-                inspection.units.iter().map(|u| (u.name.clone(), u.range)).collect(),
-            );
-        }
-        let call_leads = if is_python_path(path) {
-            python_call_leads(&facts.snapshot, &outcome.selected, facts.inspection.as_ref())
-        } else {
-            Vec::new()
-        };
-        files.push(FileEvidence {
-            path: path.clone(),
-            score: *score,
-            roles: Vec::new(),
-            priority: None,
-            leads: outcome.leads,
-            call_leads,
-            excerpts: outcome.excerpts,
-            source_omitted: false,
-        });
     }
+    // Weak candidates stay as declaration reading leads without excerpts.
+    for (index, (path, score)) in ranked.iter().enumerate() {
+        if *score < SELECTION_FLOOR {
+            let leads = facts_by_path
+                .get(path)
+                .and_then(|facts| facts.inspection.as_ref())
+                .map(|inspection| {
+                    inspection
+                        .units
+                        .iter()
+                        .filter(|unit| !unit.name.ends_with(".context"))
+                        .take(8)
+                        .map(|unit| ReadingLead {
+                            name: unit.name.clone(),
+                            range: unit.range,
+                            score: 0.0,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.push(FileEvidence {
+                path: path.clone(),
+                score: *score,
+                roles: Vec::new(),
+                priority: None,
+                leads,
+                call_leads: Vec::new(),
+                excerpts: Vec::new(),
+                source_omitted: false,
+            });
+            let _ = index;
+        }
+    }
+    files.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.path.cmp(&b.path))
+    });
 
     let t_select = phase_t0.elapsed();
-    // ---- Phase 5: role assessment ----
+    // ---- Phase 5: role assessment (files with excerpts, capped) ----
     progress.set_stage("assess");
-    for file in &mut files {
-        if interrupted() {
-            break;
-        }
-        let Some(facts) = facts_by_path.get(&file.path) else { continue };
-        let mut description = facts.description.clone();
-        if description.len() > 320 {
-            let mut end = 320;
-            while end > 0 && !description.is_char_boundary(end) {
-                end -= 1;
-            }
-            description.truncate(end);
-        }
-        let state = format!("{}\n{}", state_header(&options.query), description);
+    let assess_paths: Vec<String> = files
+        .iter()
+        .filter(|file| !file.excerpts.is_empty())
+        .take(MAX_ASSESS)
+        .map(|file| file.path.clone())
+        .collect();
+    if !assess_paths.is_empty() && !interrupted() {
         let questions = assessment_questions(&options.query);
-        match engine.evaluate(&crate::engine::Evaluation { state: &state, questions: &questions }) {
-            Ok(answers) => {
-                for role in ["implementation", "caller", "test", "fixture", "helper"] {
-                    if answers.get(role).copied().unwrap_or(0.0) > 0.65 {
-                        file.roles.push(role);
+        let states: Vec<String> = assess_paths
+            .iter()
+            .map(|path| {
+                let facts = &facts_by_path[path];
+                let mut description = facts.description.clone();
+                if description.len() > 320 {
+                    let mut end = 320;
+                    while end > 0 && !description.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    description.truncate(end);
+                }
+                format!("{}\n{}", state_header(&options.query), description)
+            })
+            .collect();
+        let evaluations: Vec<crate::engine::Evaluation> = states
+            .iter()
+            .map(|state| crate::engine::Evaluation { state, questions: &questions })
+            .collect();
+        let results = engine.evaluate_many(&evaluations);
+        let mut provider_failure: Option<String> = None;
+        for (path, result) in assess_paths.iter().zip(results.into_iter()) {
+            match result {
+                Ok(answers) => {
+                    if let Some(file) = files.iter_mut().find(|f| &f.path == path) {
+                        for role in ["implementation", "caller", "test", "fixture", "helper"] {
+                            if answers.get(role).copied().unwrap_or(0.0) > 0.65 {
+                                file.roles.push(role);
+                            }
+                        }
                     }
                 }
+                Err(EngineError(message)) => provider_failure = Some(message),
             }
-            Err(EngineError(message)) => issues.fail("provider", message),
+        }
+        if let Some(message) = provider_failure {
+            issues.fail("provider", message);
         }
     }
 

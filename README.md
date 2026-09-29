@@ -59,7 +59,18 @@ Measured behavior of the judge drove the design (details in
    leads, `AGENTS.md` lookups, and pytest entry points.
 
 All answers are cached locally (`~/.cache/layagrep`, 7-day TTL, 256 MB cap)
-keyed by exact state + questions: repeated searches are near-instant.
+keyed by exact state + questions: repeated searches are near-instant
+(measured: 0 requests, all phases ~0 s).
+
+Cold-search cost is bounded three ways (measured on a 264-file Java repo):
+candidates above the selection floor have at most their 14 most lexically
+promising declarations judged; role assessment covers only files that produced
+excerpts (capped at 25); and every phase batches its questions to the judge.
+`--workers N` parallelizes the native CPU backend (near-linear to 4 workers);
+the python backend stays at one worker because concurrent MLX processes on one
+GPU contend destructively (measured: 2 workers are 4.3× slower). The 322M
+multilingual checkpoint was calibrated and rejected: file-level separation
+collapses (relevant 0.71–0.81 vs irrelevant 0.73–0.83).
 
 ```sh
 layagrep cache clear     # reset the answer cache

@@ -1,7 +1,6 @@
-//! Per-candidate source selection: judge declaration units by description
-//! (name, signature, local calls, docstring — calibrated: 0.56–0.72 relevant
-//! vs 0.09–0.12 irrelevant), merge selected spans, expand windows with
-//! adjacent comments, and build verbatim excerpts.
+//! Per-candidate source selection, batched across files for parallel judging:
+//! build unit groups for every candidate, fan the evaluations out through the
+//! pool, then assemble per-file outcomes (merge, expand, excerpt) on the CPU.
 
 use crate::engine::{state_header, Engine};
 use crate::source::{lines_text, Inspection, LineIndex, Range, SourceUnit};
@@ -9,11 +8,15 @@ use crate::types::{Excerpt, ReadingLead};
 use crate::walk::Snapshot;
 
 const GROUP_UNIT_LIMIT: usize = 2;
+/// Units per file that reach the judge: ranked lexically first, so files with
+/// dozens of declarations do not multiply cold-search requests.
+const MAX_JUDGED_UNITS: usize = 14;
 const GROUP_SOURCE_BUDGET: usize = 380;
 const WINDOW_LINES: u32 = 3;
 const LEAD_THRESHOLD: f64 = 0.25;
 const SELECT_THRESHOLD: f64 = 0.5;
 const MAX_EXCERPT_BYTES: usize = 24_000;
+const BATCH_CHUNK: usize = 96;
 
 pub struct SelectionOutcome {
     pub selected: Vec<Range>,
@@ -22,8 +25,12 @@ pub struct SelectionOutcome {
     pub leads: Vec<ReadingLead>,
 }
 
-fn unit_instructions(name: &str, range: Range, query: &str) -> String {
-    let _ = query; // the query lives in the state header; echoing it per question doubles head tokens
+pub struct SelectionInput<'a> {
+    pub snapshot: &'a Snapshot,
+    pub inspection: Option<&'a Inspection>,
+}
+
+fn unit_instructions(name: &str, range: Range) -> String {
     format!(
         "Does the declaration {} (lines {}-{}) implement, control, or test the behavior the query asks about? \
 Count the current implementation even if buggy; generic terminology and unrelated utilities do not count.",
@@ -32,53 +39,43 @@ Count the current implementation even if buggy; generic terminology and unrelate
 }
 
 fn signature_line(source: &str, index: &LineIndex, range: Range) -> String {
-    let mut text = lines_text(source, index, Range { start_line: range.start_line, end_line: range.start_line });
+    let mut text = lines_text(
+        source,
+        index,
+        Range { start_line: range.start_line, end_line: range.start_line },
+    );
     if text.trim().is_empty() && range.end_line > range.start_line {
-        text = lines_text(source, index, Range { start_line: range.start_line + 1, end_line: range.start_line + 1 });
+        text = lines_text(
+            source,
+            index,
+            Range { start_line: range.start_line + 1, end_line: range.start_line + 1 },
+        );
     }
     text.trim().chars().take(70).collect()
 }
 
 fn unit_docstring(source: &str, index: &LineIndex, range: Range) -> Option<String> {
     for line_number in range.start_line..(range.start_line + 6).min(range.end_line + 1) {
-        let line = lines_text(source, index, Range { start_line: line_number, end_line: line_number });
+        let line = lines_text(
+            source,
+            index,
+            Range { start_line: line_number, end_line: line_number },
+        );
         let trimmed = line.trim();
-        if trimmed.starts_with("///") || trimmed.starts_with("/**") || trimmed.starts_with('#')
+        if trimmed.starts_with("///")
+            || trimmed.starts_with("/**")
+            || trimmed.starts_with('#')
             || trimmed.starts_with("\"\"\"")
         {
-            let text = trimmed.trim_matches(|c: char| c == '/' || c == '*' || c == '"' || c == '#').trim();
+            let text = trimmed
+                .trim_matches(|c: char| c == '/' || c == '*' || c == '"' || c == '#')
+                .trim();
             if text.chars().any(|c| c.is_alphabetic()) {
                 return Some(text.chars().take(90).collect());
             }
         }
     }
     None
-}
-
-/// Names of local definitions called inside the unit's body.
-fn local_calls(
-    source: &str,
-    index: &LineIndex,
-    unit: &SourceUnit,
-    defs: &[(&str, &Range)],
-) -> Vec<String> {
-    let mut calls = Vec::new();
-    for (name, def_range) in defs {
-        if def_range.start_line >= unit.range.start_line
-            && def_range.end_line <= unit.range.end_line
-        {
-            continue; // nested/own definition
-        }
-        for line_number in unit.range.start_line..=unit.range.end_line {
-            let line = lines_text(source, index, Range { start_line: line_number, end_line: line_number });
-            if line.contains(&format!("{}(", name)) {
-                calls.push((*name).to_string());
-                break;
-            }
-        }
-    }
-    calls.truncate(4);
-    calls
 }
 
 fn describe_unit(
@@ -99,21 +96,39 @@ fn describe_unit(
             parts.push(doc);
         }
     }
-    let calls = local_calls(&snapshot.source, index, unit, defs);
+    let mut calls = Vec::new();
+    for (name, def_range) in defs {
+        if def_range.start_line >= unit.range.start_line
+            && def_range.end_line <= unit.range.end_line
+        {
+            continue; // nested/own definition
+        }
+        for line_number in unit.range.start_line..=unit.range.end_line {
+            let line = lines_text(
+                &snapshot.source,
+                index,
+                Range { start_line: line_number, end_line: line_number },
+            );
+            if line.contains(&format!("{}(", name)) {
+                calls.push((*name).to_string());
+                break;
+            }
+        }
+    }
+    calls.truncate(4);
     if !calls.is_empty() {
         parts.push(format!("calls {}", calls.join(", ")));
     }
     parts.join(" | ")
 }
 
-/// Judge every unit; returns per-unit scores in unit order.
-fn judge_units(
-    snapshot: &Snapshot,
-    inspection: &Inspection,
-    query: &str,
-    engine: &mut Engine,
-    provider_failures: &mut u32,
-) -> Vec<f64> {
+struct UnitGroup {
+    unit_indices: Vec<usize>,
+    state: String,
+    questions: Vec<(String, crate::worker::Question)>,
+}
+
+fn build_groups(snapshot: &Snapshot, inspection: &Inspection, query: &str) -> Vec<UnitGroup> {
     let index = LineIndex::new(&snapshot.source);
     let defs: Vec<(&str, &Range)> = inspection
         .units
@@ -124,61 +139,83 @@ fn judge_units(
             (bare, &unit.range)
         })
         .collect();
-    let mut scores = Vec::with_capacity(inspection.units.len());
-    let mut group: Vec<&SourceUnit> = Vec::new();
+    if inspection.units.len() <= MAX_JUDGED_UNITS {
+        return build_groups_for(&index, inspection, &(0..inspection.units.len()).collect::<Vec<_>>(), snapshot, query, &defs);
+    }
+    // Rank units lexically against the query; judge only the strongest.
+    let descriptions: Vec<String> = inspection
+        .units
+        .iter()
+        .map(|unit| describe_unit(snapshot, &index, unit, &defs))
+        .collect();
+    let corpus = crate::rank::DescriptionCorpus::new(
+        (0..inspection.units.len()).map(|i| i.to_string()).collect(),
+        descriptions.clone(),
+    );
+    let ranked = corpus.rank(query);
+    let mut order: Vec<usize> = (0..inspection.units.len()).collect();
+    order.sort_by(|a, b| {
+        ranked[*b]
+            .partial_cmp(&ranked[*a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(b))
+    });
+    let chosen: Vec<usize> = order.into_iter().take(MAX_JUDGED_UNITS).collect();
+    build_groups_for(&index, inspection, &chosen, snapshot, query, &defs)
+}
+
+fn build_groups_for(
+    index: &LineIndex,
+    inspection: &Inspection,
+    chosen: &[usize],
+    snapshot: &Snapshot,
+    query: &str,
+    defs: &[(&str, &Range)],
+) -> Vec<UnitGroup> {
+    let mut groups: Vec<UnitGroup> = Vec::new();
     let mut group_bytes = 0usize;
-
-    let mut flush = |group: &mut Vec<&SourceUnit>, engine: &mut Engine| {
-        if group.is_empty() {
-            return;
-        }
-        let mut state = format!("{}\nFile: {}\nDeclarations:\n", state_header(query), snapshot.path);
-        for unit in group.iter() {
-            state.push_str(&describe_unit(snapshot, &index, unit, &defs));
-            state.push('\n');
-        }
-        let questions: Vec<(String, crate::worker::Question)> = group
-            .iter()
-            .enumerate()
-            .map(|(i, unit)| {
-                (
-                    format!("q{}", i),
-                    crate::worker::Question::Noul {
-                        instructions: unit_instructions(&unit.name, unit.range, query),
-                    },
-                )
-            })
-            .collect();
-        match engine.evaluate(&crate::engine::Evaluation {
-            state: &state,
-            questions: &questions,
-        }) {
-            Ok(answers) => {
-                for (i, _) in group.iter().enumerate() {
-                    scores.push(answers.get(&format!("q{}", i)).copied().unwrap_or(0.0));
-                }
-            }
-            Err(_) => {
-                *provider_failures += 1;
-                scores.extend(std::iter::repeat(0.0).take(group.len()));
-            }
-        }
-        group.clear();
-    };
-
-    for unit in &inspection.units {
-        let cost = unit.name.len() + 140; // descriptions are bounded by construction
-        if !group.is_empty()
-            && (group.len() >= GROUP_UNIT_LIMIT || group_bytes + cost > GROUP_SOURCE_BUDGET)
+    let mut current: Vec<usize> = Vec::new();
+    for unit_index in chosen.iter().copied() {
+        let unit = &inspection.units[unit_index];
+        let cost = unit.name.len() + 140;
+        if !current.is_empty()
+            && (current.len() >= GROUP_UNIT_LIMIT || group_bytes + cost > GROUP_SOURCE_BUDGET)
         {
-            flush(&mut group, engine);
+            let drained = std::mem::take(&mut current);
+            groups.push(finish_group(snapshot, &index, inspection, &drained, query, &defs));
             group_bytes = 0;
         }
-        group.push(unit);
+        current.push(unit_index);
         group_bytes += cost;
     }
-    flush(&mut group, engine);
-    scores
+    if !current.is_empty() {
+        groups.push(finish_group(snapshot, &index, inspection, &current, query, &defs));
+    }
+    groups
+}
+
+fn finish_group(
+    snapshot: &Snapshot,
+    index: &LineIndex,
+    inspection: &Inspection,
+    unit_indices: &[usize],
+    query: &str,
+    defs: &[(&str, &Range)],
+) -> UnitGroup {
+    let mut state = format!("{}\nFile: {}\nDeclarations:\n", state_header(query), snapshot.path);
+    let mut questions = Vec::new();
+    for (position, unit_index) in unit_indices.iter().enumerate() {
+        let unit = &inspection.units[*unit_index];
+        state.push_str(&describe_unit(snapshot, index, unit, defs));
+        state.push('\n');
+        questions.push((
+            format!("q{}", position),
+            crate::worker::Question::Noul {
+                instructions: unit_instructions(&unit.name, unit.range),
+            },
+        ));
+    }
+    UnitGroup { unit_indices: unit_indices.to_vec(), state, questions }
 }
 
 fn merge_ranges(mut ranges: Vec<Range>) -> Vec<Range> {
@@ -196,8 +233,6 @@ fn merge_ranges(mut ranges: Vec<Range>) -> Vec<Range> {
     merged
 }
 
-/// Expand a range by ±`window` lines and absorb comments separated only by
-/// blank lines, mirroring jevgrep's excerpt windows.
 fn expand_with_comments(
     range: Range,
     index: &LineIndex,
@@ -239,40 +274,16 @@ fn expand_with_comments(
     window
 }
 
-pub fn select_file(
+fn assemble_outcome(
     snapshot: &Snapshot,
-    inspection: Option<&Inspection>,
-    query: &str,
-    engine: &mut Engine,
-) -> (SelectionOutcome, Vec<(&'static str, u32)>) {
-    let debug = std::env::var_os("LAYAGREP_DEBUG_UNITS").is_some();
-    let mut issues: Vec<(&'static str, u32)> = Vec::new();
+    inspection: &Inspection,
+    unit_scores: &[f64],
+) -> SelectionOutcome {
     let index = LineIndex::new(&snapshot.source);
     let line_count = index.line_count as u32;
-
-    let fallback_inspection;
-    let inspection = match inspection {
-        Some(inspection) => inspection,
-        None => {
-            fallback_inspection = crate::source::inspect(snapshot);
-            &fallback_inspection
-        }
-    };
-
-    let mut provider_failures = 0u32;
-    let judged = judge_units(snapshot, inspection, query, engine, &mut provider_failures);
-    if debug {
-        for (unit, score) in inspection.units.iter().zip(judged.iter()) {
-            eprintln!("[unit] {:.3} {} {}:{}-{}", score, unit.name, snapshot.path, unit.range.start_line, unit.range.end_line);
-        }
-    }
-    if provider_failures > 0 {
-        issues.push(("provider", provider_failures));
-    }
-
     let mut selected: Vec<Range> = Vec::new();
     let mut leads: Vec<ReadingLead> = Vec::new();
-    for (unit, score) in inspection.units.iter().zip(judged.iter()) {
+    for (unit, score) in inspection.units.iter().zip(unit_scores.iter()) {
         if *score > SELECT_THRESHOLD {
             selected.push(unit.range);
         }
@@ -325,13 +336,107 @@ pub fn select_file(
         }
     }
 
-    (
-        SelectionOutcome {
-            selected,
-            rendered,
-            excerpts,
-            leads: deduped,
-        },
-        issues,
-    )
+    SelectionOutcome {
+        selected,
+        rendered,
+        excerpts,
+        leads: deduped,
+    }
+}
+
+/// Batch selection across files: unit groups from every file are judged in
+/// parallel through the engine pool, then outcomes assemble per file. Returns
+/// one `(outcome, issues)` pair per input, in input order.
+pub fn select_files(
+    inputs: &[SelectionInput],
+    query: &str,
+    engine: &mut Engine,
+    progress: &mut dyn FnMut(usize),
+) -> Vec<(SelectionOutcome, Vec<(&'static str, u32)>)> {
+    // Resolve inspections once; derive missing ones.
+    let owned: Vec<Inspection> = inputs
+        .iter()
+        .map(|input| match input.inspection {
+            Some(inspection) => inspection.clone(),
+            None => crate::source::inspect(input.snapshot),
+        })
+        .collect();
+
+    // Build unit groups per file.
+    let per_file: Vec<Vec<UnitGroup>> = inputs
+        .iter()
+        .zip(owned.iter())
+        .map(|(input, inspection)| build_groups(input.snapshot, inspection, query))
+        .collect();
+
+    // Flatten groups across files in submission order.
+    let mut layout: Vec<(usize, usize)> = Vec::new(); // (file index, group index)
+    let mut jobs: Vec<(String, Vec<(String, crate::worker::Question)>)> = Vec::new();
+    for (file_index, groups) in per_file.iter().enumerate() {
+        for (group_index, group) in groups.iter().enumerate() {
+            jobs.push((group.state.clone(), group.questions.clone()));
+            layout.push((file_index, group_index));
+        }
+    }
+
+    // Judge in chunks; answers arrive in submission order.
+    let mut all_answers: Vec<Option<Vec<f64>>> = Vec::with_capacity(jobs.len());
+    for chunk in jobs.chunks(BATCH_CHUNK) {
+        let evaluations: Vec<crate::engine::Evaluation> = chunk
+            .iter()
+            .map(|(state, questions)| crate::engine::Evaluation { state, questions })
+            .collect();
+        let results = engine.evaluate_many(&evaluations);
+        for result in results {
+            match result {
+                Ok(answers) => {
+                    let count = answers.len();
+                    let scores: Vec<f64> = (0..count)
+                        .map(|i| *answers.get(&format!("q{}", i)).unwrap_or(&0.0))
+                        .collect();
+                    all_answers.push(Some(scores));
+                }
+                Err(_) => all_answers.push(None),
+            }
+        }
+        progress(chunk.len());
+    }
+
+    // Scatter group answers back to their files.
+    let mut group_answers: Vec<Vec<Option<Vec<f64>>>> =
+        per_file.iter().map(|groups| vec![None; groups.len()]).collect();
+    for ((file_index, group_index), answer) in layout.iter().zip(all_answers.into_iter()) {
+        group_answers[*file_index][*group_index] = answer;
+    }
+
+    // Assemble per-file outcomes.
+    let mut outcomes = Vec::with_capacity(inputs.len());
+    for (((input, inspection), groups), answers) in inputs
+        .iter()
+        .zip(owned.iter())
+        .zip(per_file.iter())
+        .zip(group_answers.into_iter())
+    {
+        let mut unit_scores = vec![0.0_f64; inspection.units.len()];
+        let mut provider_failures = 0u32;
+        for (group, answer) in groups.iter().zip(answers.into_iter()) {
+            match answer {
+                Some(scores) => {
+                    for (unit_index, score) in group.unit_indices.iter().zip(scores.iter()) {
+                        if *unit_index < unit_scores.len() {
+                            unit_scores[*unit_index] = *score;
+                        }
+                    }
+                }
+                None => provider_failures += 1,
+            }
+        }
+        let issues = if provider_failures > 0 {
+            vec![("provider", provider_failures)]
+        } else {
+            Vec::new()
+        };
+        outcomes.push((assemble_outcome(input.snapshot, inspection, &unit_scores), issues));
+    }
+    outcomes
 }

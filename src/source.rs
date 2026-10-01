@@ -593,6 +593,11 @@ pub fn text_units(source: &str, index: &LineIndex) -> Vec<SourceUnit> {
     let mut start_line = 1u32;
     while start < total {
         let mut end = (start + TEXT_CHUNK_BYTES).min(total);
+        // The byte budget can land inside a multi-byte UTF-8 character;
+        // step forward (at most 3 bytes) to the next char boundary.
+        while end < total && !source.is_char_boundary(end) {
+            end += 1;
+        }
         if end < total {
             // Split on a line boundary when one is reachable.
             if let Some(newline) = source[start..end].rfind('\n') {

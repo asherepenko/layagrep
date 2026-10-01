@@ -24,6 +24,18 @@ fn names(snapshot: &Snapshot) -> Vec<String> {
 }
 
 #[test]
+fn text_units_multibyte_chunk_boundary() {
+    // 2499 a's put the 2500-byte chunk boundary inside the em-dash
+    // (bytes 2499..2502) — text_units must not slice mid-character.
+    let text = format!("{}—{}", "a".repeat(2499), "b".repeat(100));
+    let snapshot = snapshot_of("notes.md", &text);
+    let units = inspect(&snapshot).units;
+    assert!(!units.is_empty());
+    let covered: usize = units.iter().map(|u| u.byte_end - u.byte_start).sum();
+    assert_eq!(covered, text.len());
+}
+
+#[test]
 fn export_naming() {
     let text = "import { x } from \"y\";\n\nexport type Thing = { a: string };\n\nexport function makeThing(): Thing {\n  return { a: \"b\" };\n}\n";
     let units = names(&snapshot_of("mod.ts", text));

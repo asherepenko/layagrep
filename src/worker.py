@@ -11,13 +11,22 @@ The worker prints {"ready": true, ...} once the model is loaded, then serves std
 """
 import argparse
 import json
+import os
 import sys
 import time
 
+# Quiet by default: huggingface_hub's tqdm bars and telemetry fight the Rust
+# spinner for stderr. setdefault so an explicit env var still wins.
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+
+QUIET = False
+
 
 def log(message):
-    sys.stderr.write("[layagrep-worker] %s\n" % message)
-    sys.stderr.flush()
+    if not QUIET:
+        sys.stderr.write("[layagrep-worker] %s\n" % message)
+        sys.stderr.flush()
 
 
 def main():
@@ -26,7 +35,11 @@ def main():
     parser.add_argument("--dtype", default="float16", choices=["float32", "float16", "bfloat16"])
     parser.add_argument("--device", default=None, choices=[None, "gpu", "cpu"])
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--quiet", action="store_true", help="suppress worker stderr logs")
     args = parser.parse_args()
+
+    global QUIET
+    QUIET = args.quiet
 
     import warnings
     with warnings.catch_warnings():
@@ -34,12 +47,16 @@ def main():
         import laya_mlx as laya
 
     started = time.time()
-    agent = laya.load(
-        args.model,
-        device=args.device,
-        dtype=args.dtype,
-        batch_size=args.batch_size,
-    )
+    # Model load also emits warnings (checkpoint temperature note); keep it
+    # inside the ignore scope too.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        agent = laya.load(
+            args.model,
+            device=args.device,
+            dtype=args.dtype,
+            batch_size=args.batch_size,
+        )
     log("model %s ready in %.2fs" % (args.model, time.time() - started))
     sys.stdout.write(
         json.dumps({"ready": True, "model": args.model, "dtype": args.dtype}) + "\n"

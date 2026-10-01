@@ -145,9 +145,10 @@ impl PythonJudge {
         model_id: &str,
         dtype: &str,
         python: Option<&str>,
+        quiet: bool,
         ready_timeout: Duration,
     ) -> Result<Self, JudgeError> {
-        let worker = Worker::spawn(model_id, dtype, python, ready_timeout)
+        let worker = Worker::spawn(model_id, dtype, python, quiet, ready_timeout)
             .map_err(|e| JudgeError(format!("python worker: {}", e)))?;
         Ok(PythonJudge {
             worker,
@@ -220,6 +221,7 @@ pub fn create_judge(
     model_id: &str,
     dtype: &str,
     python: Option<&str>,
+    quiet: bool,
 ) -> Result<Box<dyn Judge>, JudgeError> {
     match kind {
         EngineKind::Native => Ok(Box::new(NativeJudge::load(model_id, dtype)?)),
@@ -227,11 +229,12 @@ pub fn create_judge(
             model_id,
             dtype,
             python,
+            quiet,
             Duration::from_secs(600),
         )?)),
         EngineKind::Auto => {
             if python_laya_available() {
-                if let Ok(judge) = PythonJudge::launch(model_id, dtype, python, Duration::from_secs(600)) {
+                if let Ok(judge) = PythonJudge::launch(model_id, dtype, python, quiet, Duration::from_secs(600)) {
                     return Ok(Box::new(judge));
                 }
             }
@@ -260,7 +263,7 @@ pub struct PoolJudge {
     submit: Option<sync_mpsc::Sender<PoolJob>>,
     handles: Vec<std::thread::JoinHandle<()>>,
     workers: usize,
-    description: String,
+    description: Arc<Mutex<String>>,
 }
 
 impl PoolJudge {
@@ -310,9 +313,10 @@ impl PoolJudge {
             submit: Some(submit),
             handles,
             workers,
-            description: Arc::try_unwrap(description)
-                .map(|guard| guard.into_inner().unwrap_or_default())
-                .unwrap_or_default(),
+            // Threads keep their Arc clones for the pool's lifetime, so
+            // try_unwrap here would always fail and drop the description —
+            // read through the Arc instead (worker 0 fills it after load).
+            description,
         })
     }
 
@@ -336,7 +340,10 @@ impl Judge for PoolJudge {
     }
 
     fn describe(&self) -> String {
-        self.description.clone()
+        self.description
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
     }
 
     fn predict_many(

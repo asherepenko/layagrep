@@ -128,6 +128,7 @@ impl Worker {
         model: &str,
         dtype: &str,
         python: Option<&str>,
+        quiet: bool,
         ready_timeout: Duration,
     ) -> Result<Self, WorkerError> {
         let (python, origin) = find_python(python)?;
@@ -140,13 +141,18 @@ impl Worker {
             .map_err(|e| WorkerError(format!("cannot write {}: {}", script.display(), e)))?;
 
         let started = Instant::now();
-        let mut child = Command::new(&python)
+        let mut command = Command::new(&python);
+        command
             .arg("-u")
             .arg(&script)
             .arg("--model")
             .arg(model)
             .arg("--dtype")
-            .arg(dtype)
+            .arg(dtype);
+        if quiet {
+            command.arg("--quiet");
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())

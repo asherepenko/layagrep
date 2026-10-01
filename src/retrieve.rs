@@ -22,7 +22,9 @@ use crate::types::*;
 use crate::walk::{walk, ChildKind, Policy, Snapshot, SnapshotStatus};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const MIN_LEXICAL: f64 = 0.06;
 const SEMANTIC_FLOOR: f64 = 0.3;
@@ -36,52 +38,242 @@ const PROPAGATION_ROUNDS: usize = 2;
 const REQUEST_LIMIT: u64 = 6_000;
 const MAX_CANDIDATES: usize = 40;
 
+pub(crate) const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_TICK_MS: u64 = 100;
+
+/// Progress snapshot for non-terminal consumers (the TUI status line).
+#[derive(Debug, Clone)]
+pub struct ProgressEvent {
+    pub stage: &'static str,
+    pub files_done: usize,
+    pub files_total: usize,
+}
+
 pub struct Progress {
+    state: Arc<Mutex<ProgressState>>,
+    stop: Arc<AtomicBool>,
+    ticker: Option<std::thread::JoinHandle<()>>,
+    sender: Option<std::sync::mpsc::Sender<ProgressEvent>>,
     enabled: bool,
-    started: Instant,
+    verbose: bool,
+    finished: bool,
+}
+
+struct ProgressState {
+    stage: &'static str,
     files_total: usize,
     files_done: usize,
-    stage: &'static str,
+    started: Instant,
+    frame: usize,
+    max_width: usize,
+}
+
+/// The single spinner line for a state. Pure so the residue-clearing padding
+/// is unit-testable.
+pub fn spinner_line(state: &ProgressState) -> String {
+    let elapsed = state.started.elapsed().as_secs_f64();
+    let frame = SPINNER_FRAMES[state.frame % SPINNER_FRAMES.len()];
+    if state.files_total > 0 {
+        format!(
+            "{} {} · {}/{} files · {:.1}s",
+            frame, state.stage, state.files_done, state.files_total, elapsed
+        )
+    } else {
+        format!("{} {} · {:.1}s", frame, state.stage, elapsed)
+    }
 }
 
 impl Progress {
-    pub fn new(enabled: bool) -> Self {
-        Progress {
-            enabled,
-            started: Instant::now(),
-            files_total: 0,
-            files_done: 0,
-            stage: "describe",
+    /// Event-reporting progress for the TUI: no stderr writes (they would
+    /// corrupt the terminal UI), every update also sent to the channel.
+    pub fn reporting(sender: std::sync::mpsc::Sender<ProgressEvent>) -> Self {
+        Progress::new(false, false).with_sender(sender)
+    }
+
+    fn with_sender(mut self, sender: std::sync::mpsc::Sender<ProgressEvent>) -> Self {
+        self.sender = Some(sender);
+        self
+    }
+
+    fn report(&self) {
+        if let Some(sender) = &self.sender {
+            if let Ok(guard) = self.state.lock() {
+                let _ = sender.send(ProgressEvent {
+                    stage: guard.stage,
+                    files_done: guard.files_done,
+                    files_total: guard.files_total,
+                });
+            }
         }
     }
+
+    pub fn new(enabled: bool, verbose: bool) -> Self {
+        let mut progress = Progress {
+            state: Arc::new(Mutex::new(ProgressState {
+                stage: "describe",
+                files_total: 0,
+                files_done: 0,
+                started: Instant::now(),
+                frame: 0,
+                max_width: 0,
+            })),
+            stop: Arc::new(AtomicBool::new(false)),
+            ticker: None,
+            sender: None,
+            enabled,
+            verbose,
+            finished: false,
+        };
+        if enabled {
+            let state = Arc::clone(&progress.state);
+            let stop = Arc::clone(&progress.stop);
+            progress.ticker = Some(std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(SPINNER_TICK_MS));
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(mut guard) = state.lock() {
+                    guard.frame += 1;
+                    let line = spinner_line(&guard);
+                    let width = line.chars().count();
+                    if width > guard.max_width {
+                        guard.max_width = width;
+                    }
+                    eprint!("\r{}", pad_to(&line, guard.max_width));
+                }
+            }));
+        }
+        progress
+    }
+
+    pub fn set_total(&mut self, total: usize) {
+        if let Ok(mut guard) = self.state.lock() {
+            guard.files_total = total;
+        }
+        self.render_now();
+        self.report();
+    }
+
     fn set_stage(&mut self, stage: &'static str) {
-        self.stage = stage;
-        self.render();
+        if let Ok(mut guard) = self.state.lock() {
+            guard.stage = stage;
+        }
+        self.render_now();
+        self.report();
     }
+
     fn bump(&mut self, files: usize) {
-        self.files_done += files;
-        self.render();
+        if let Ok(mut guard) = self.state.lock() {
+            guard.files_done += files;
+        }
+        self.render_now();
+        self.report();
     }
-    fn render(&self) {
+
+    fn render_now(&self) {
         if !self.enabled {
             return;
         }
-        eprint!(
-            "\r[layagrep] {:<10} files {}/{} elapsed {:.1}s   ",
-            self.stage,
-            self.files_done,
-            self.files_total,
-            self.started.elapsed().as_secs_f64()
-        );
-    }
-    pub fn finish(&self) {
-        if self.enabled {
-            eprintln!(
-                "\r[layagrep] done in {:.1}s ({} files scored)",
-                self.started.elapsed().as_secs_f64(),
-                self.files_done
-            );
+        if let Ok(mut guard) = self.state.lock() {
+            let line = spinner_line(&guard);
+            let width = line.chars().count();
+            if width > guard.max_width {
+                guard.max_width = width;
+            }
+            eprint!("\r{}", pad_to(&line, guard.max_width));
         }
+    }
+
+    /// Stop the spinner and erase its line. The stdout report carries the
+    /// summary; under verbose, keep the one-line timing diagnostic.
+    pub fn finish(&mut self) {
+        let summary = if self.verbose {
+            self.state.lock().ok().map(|guard| {
+                format!(
+                    "[layagrep] done in {:.1}s ({} files scored)",
+                    guard.started.elapsed().as_secs_f64(),
+                    guard.files_done
+                )
+            })
+        } else {
+            None
+        };
+        self.teardown();
+        if let Some(line) = summary {
+            eprintln!("{}", line);
+        }
+    }
+
+    fn teardown(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        if let Some(handle) = self.ticker.take() {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+        if self.enabled {
+            let width = self
+                .state
+                .lock()
+                .map(|guard| guard.max_width)
+                .unwrap_or(0);
+            eprint!("\r{}\r", " ".repeat(width));
+        }
+    }
+}
+
+impl Drop for Progress {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+fn pad_to(line: &str, width: usize) -> String {
+    let current = line.chars().count();
+    if current >= width {
+        line.to_string()
+    } else {
+        format!("{}{}", line, " ".repeat(width - current))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(files_done: usize, files_total: usize, stage: &'static str) -> ProgressState {
+        ProgressState {
+            stage,
+            files_total,
+            files_done,
+            started: Instant::now(),
+            frame: 0,
+            max_width: 0,
+        }
+    }
+
+    #[test]
+    fn spinner_line_includes_counts_and_stage() {
+        let line = spinner_line(&state(12, 1081, "score"));
+        assert!(line.contains("score"), "line: {}", line);
+        assert!(line.contains("12/1081 files"), "line: {}", line);
+    }
+
+    #[test]
+    fn spinner_line_without_total_omits_counts() {
+        let line = spinner_line(&state(0, 0, "describe"));
+        assert!(!line.contains("files"), "line: {}", line);
+    }
+
+    #[test]
+    fn pad_to_clears_residue_from_longer_previous_renders() {
+        // Regression: finish() used to leave the tail of a longer prior
+        // render on the line ("... 86.1s" residue).
+        assert_eq!(pad_to("short", 10).chars().count(), 10);
+        assert_eq!(pad_to("exactly-10", 10), "exactly-10");
+        assert_eq!(pad_to("longer than width", 5), "longer than width");
     }
 }
 
@@ -446,7 +638,7 @@ pub fn retrieve(
                 })
         })
         .collect();
-    progress.files_total = file_set.len();
+    progress.set_total(file_set.len());
 
     for directory in &walked.tree.directories {
         for child in &directory.children {

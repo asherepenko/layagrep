@@ -14,6 +14,13 @@ instead of a cloud LLM. No API keys; everything runs on your machine.
 layagrep "How are telemetry events recorded and sent?" ./my-project
 ```
 
+For interactive browsing, `layagrep tui "question" .` runs the same search
+with a terminal UI: grouped file list, excerpt/declaration detail pane,
+`Space` marks files, `q` quits and prints the marked evidence to stdout
+(pipes keep working), `Esc` quits silently.
+
+```
+
 ## Requirements
 
 - Rust 1.85+ with a C compiler (cmake not required; tree-sitter grammars

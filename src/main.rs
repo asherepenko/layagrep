@@ -9,6 +9,7 @@ mod render;
 mod retrieve;
 mod selection;
 mod source;
+mod tui;
 mod types;
 mod walk;
 mod worker;
@@ -52,7 +53,7 @@ impl Dtype {
     version,
     disable_help_subcommand = true,
     arg_required_else_help = true,
-    after_help = "Examples:\n  layagrep \"How are telemetry events recorded and sent?\" .\n  layagrep --json \"Where is auth checked before a handler?\" ./src\n  layagrep --engine native --workers 4 \"retry behavior on timeout?\"\n\nCommands:\n  layagrep doctor              verify the judge backend end to end\n  layagrep cache clear         clear cached judge answers\n  layagrep skill --dir .       write the agent SKILL.md\n\nEnvironment:\n  LAYAGREP_PYTHON             interpreter for the python backend (same as --python)\n\nExit codes:\n  0 complete  1 failed  2 incomplete (issues reported)  130 interrupted\n\nThe report goes to stdout; progress and engine logs go to stderr.\nEvaluation answers are cached in $XDG_CACHE_HOME/layagrep (7-day TTL, 256 MB\ncap); repeated searches skip the judge entirely."
+    after_help = "Examples:\n  layagrep \"How are telemetry events recorded and sent?\" .\n  layagrep --json \"Where is auth checked before a handler?\" ./src\n  layagrep --engine native --workers 4 \"retry behavior on timeout?\"\n\nCommands:\n  layagrep doctor              verify the judge backend end to end\n  layagrep cache clear         clear cached judge answers\n  layagrep skill --dir .       write the agent SKILL.md\n  layagrep tui \"question\" .    interactive results browser\n\nEnvironment:\n  LAYAGREP_PYTHON             interpreter for the python backend (same as --python)\n\nExit codes:\n  0 complete  1 failed  2 incomplete (issues reported)  130 interrupted\n\nThe report goes to stdout; progress and engine logs go to stderr.\nEvaluation answers are cached in $XDG_CACHE_HOME/layagrep (7-day TTL, 256 MB\ncap); repeated searches skip the judge entirely."
 )]
 struct Cli {
     /// Natural-language repository question, e.g. "How are requests cached?"
@@ -101,9 +102,13 @@ struct Cli {
     #[arg(long)]
     python: Option<String>,
 
-    /// Suppress stderr progress output (engine info still prints once)
+    /// Suppress all stderr output, even in a terminal
     #[arg(long, short = 'q')]
     quiet: bool,
+
+    /// Print diagnostics to stderr (worker logs, engine info, timing)
+    #[arg(long)]
+    verbose: bool,
 
     /// Print per-file relevance scores to stderr
     #[arg(long)]
@@ -156,6 +161,57 @@ enum Command {
         #[arg(long, help = "Python interpreter hosting laya_mlx")]
         python: Option<String>,
     },
+    /// Interactive results browser in the terminal
+    #[command(
+        long_about = "Interactive results browser.\n\nRuns the search with a status line, then shows the grouped file list\n(source before tests) with a detail pane: excerpts with line numbers and\ndeclaration locations for the selected file. Space marks files; q quits and\nprints marked evidence to stdout; Esc quits silently. Requires a terminal."
+    )]
+    Tui {
+        /// Natural-language repository question, e.g. "How are requests cached?"
+        query: String,
+
+        /// Search root directory (default: current directory)
+        root: Option<String>,
+
+        /// Include hidden (dot-prefixed) paths
+        #[arg(long)]
+        hidden: bool,
+
+        /// Disable .gitignore/.ignore pattern matching (global git excludes still apply)
+        #[arg(long)]
+        no_ignore: bool,
+
+        /// Include dependency and build directories (node_modules, target, dist, ...)
+        #[arg(long)]
+        include_dependencies: bool,
+
+        /// Include known sensitive filenames (.env, *.pem, id_rsa, ...) and private-key content
+        #[arg(long)]
+        include_sensitive: bool,
+
+        /// Disable answer-cache reads and writes for this run
+        #[arg(long)]
+        no_cache: bool,
+
+        /// Judge backend: auto prefers an installed laya-mlx python package, else native
+        #[arg(long, value_enum, default_value_t = EngineChoice::Auto)]
+        engine: EngineChoice,
+
+        /// Laya checkpoint: Hugging Face id or local path
+        #[arg(long, default_value = judge::DEFAULT_MODEL_ID)]
+        model: String,
+
+        /// Model dtype; the native backend promotes float16/bfloat16 to float32 on CPU
+        #[arg(long, value_enum, default_value_t = Dtype::Float16)]
+        dtype: Dtype,
+
+        /// Python interpreter hosting laya_mlx; default: the laya-mlx launcher's interpreter, then LAYAGREP_PYTHON, then python3
+        #[arg(long)]
+        python: Option<String>,
+
+        /// Parallel judge workers (0 = auto: 1 for python, 4 for native)
+        #[arg(long, default_value_t = 0)]
+        workers: usize,
+    },
     /// Cache management
     #[command(long_about = "Cache management.\n\nEvaluation answers live in $XDG_CACHE_HOME/layagrep (default ~/.cache/layagrep): JSON entries keyed by exact state + questions, 7-day TTL, 256 MB cap, oldest-first eviction. The resident python worker script is cached there too.")]
     Cache {
@@ -185,6 +241,50 @@ fn main() {
         .unwrap_or_default();
 
     let code = match cli.command.as_ref() {
+        Some(Command::Tui {
+            query,
+            root,
+            hidden,
+            no_ignore,
+            include_dependencies,
+            include_sensitive,
+            no_cache,
+            engine,
+            model,
+            dtype,
+            python,
+            workers,
+        }) => {
+            let root = root.clone().unwrap_or_else(|| ".".to_string());
+            if !PathBuf::from(&root).is_dir() {
+                eprintln!("Search root must be a directory: {}", root);
+                1
+            } else {
+                let policy = walk::Policy {
+                    hidden: *hidden,
+                    no_ignore: *no_ignore,
+                    include_dependencies: *include_dependencies,
+                    include_sensitive: *include_sensitive,
+                };
+                match tui::run(
+                    query,
+                    &root,
+                    policy,
+                    model,
+                    dtype.as_str(),
+                    to_engine(*engine),
+                    python.as_deref(),
+                    *workers,
+                    *no_cache,
+                ) {
+                    Ok(code) => code,
+                    Err(message) => {
+                        eprintln!("{}", message);
+                        1
+                    }
+                }
+            }
+        }
         Some(Command::Doctor { engine, model, dtype, python }) => doctor(
             to_engine(*engine),
             model,
@@ -235,6 +335,7 @@ fn search(cli: &Cli, query: String) -> i32 {
     let dtype = cli.dtype.as_str().to_string();
     let python = cli.python.clone();
     let requested = cli.workers;
+    let worker_quiet = !cli.verbose;
     let mut factory: engine::JudgeFactory = Box::new(move || {
         // Measured on M2 Max: python (MLX GPU) workers contend destructively
         // (2 workers = 4.3x slower); native CPU workers scale near-linearly.
@@ -251,16 +352,16 @@ fn search(cli: &Cli, query: String) -> i32 {
         let dtype = dtype.clone();
         let python = python.clone();
         let pool = judge::PoolJudge::spawn(workers, move |_| {
-            judge::create_judge(kind, &model, &dtype, python.as_deref())
+            judge::create_judge(kind, &model, &dtype, python.as_deref(), worker_quiet)
         })?;
         Ok(Box::new(pool) as Box<dyn judge::Judge>)
     });
     let cache = cache::Cache::new(worker::cache_dir(), !cli.no_cache);
     let mut engine = engine::Engine::new(&cli.model, factory, cache);
-    let mut progress = retrieve::Progress::new(!cli.quiet && stderr_isatty());
+    let mut progress = retrieve::Progress::new(!cli.quiet && stderr_isatty(), cli.verbose);
     let options = retrieve::SearchOptions { policy, query: query.clone(), root, debug_scores: cli.debug_scores };
     let result = retrieve::retrieve(&options, &mut engine, &mut progress, &interrupted);
-    if !cli.quiet {
+    if cli.verbose {
         match engine.backend() {
             Some(backend) => eprintln!("[layagrep] engine: {}", backend.describe()),
             None => eprintln!("[layagrep] engine: fully cached, no judge spawned"),
@@ -288,7 +389,7 @@ fn doctor(engine_kind: judge::EngineKind, model: &str, dtype: &str, python: Opti
     let dtype_owned = dtype.to_string();
     let python_owned = python.map(str::to_string);
     let mut factory: engine::JudgeFactory =
-        Box::new(move || judge::create_judge(engine_kind, &model_owned, &dtype_owned, python_owned.as_deref()));
+        Box::new(move || judge::create_judge(engine_kind, &model_owned, &dtype_owned, python_owned.as_deref(), false));
     let mut engine = engine::Engine::new(model, factory, cache::Cache::new(worker::cache_dir(), false));
     if let Err(error) = engine.spawn_now() {
         eprintln!("Laya engine check failed: {}", error);

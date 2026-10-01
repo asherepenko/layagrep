@@ -82,7 +82,7 @@ fn retrieves_relevant_file_and_excerpts() {
         root: root.to_string_lossy().into_owned(),
         debug_scores: false,
     };
-    let mut progress = retrieve::Progress::new(false);
+    let mut progress = retrieve::Progress::new(false, false);
     let result = retrieve::retrieve(&options, &mut engine, &mut progress, &|| false);
 
     assert_eq!(result.status, types::Status::Complete);
